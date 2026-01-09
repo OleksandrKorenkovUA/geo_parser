@@ -1,0 +1,28 @@
+[project]
+name = "geovlm_poc"
+version = "0.1.0"
+requires-python = ">=3.8"
+dependencies = [
+  "numpy",
+  "rasterio",
+  "shapely",
+  "pydantic>=2",
+  "httpx",
+  "Pillow",
+  "opencv-python",
+  "opentelemetry-api",
+  "opentelemetry-sdk",
+  "opentelemetry-exporter-otlp",
+]
+
+[project.optional-dependencies]
+yolo = ["ultralytics"]
+clip = ["open_clip_torch", "torch"]
+cnn = ["torch", "torchvision"]
+faiss = ["faiss-cpu"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[project.scripts]
+geovlm-poc = "geovlm_poc.cli:main"

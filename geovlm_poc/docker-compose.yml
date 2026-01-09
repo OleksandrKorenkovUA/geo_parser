@@ -1,0 +1,23 @@
+services:
+  geovlm-poc:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        PIP_EXTRAS: "yolo"
+    image: geovlm-poc:latest
+    env_file:
+      - .env
+    volumes:
+      - type: bind
+        source: ./data
+        target: /data
+        bind:
+          create_host_path: true
+      - type: bind
+        source: ./out
+        target: /out
+        bind:
+          create_host_path: true
+    entrypoint: ["geovlm-poc"]
+    command: ["--help"]
