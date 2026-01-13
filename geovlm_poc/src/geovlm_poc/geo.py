@@ -1,8 +1,9 @@
 from typing import Any, Dict, List, Tuple
 import logging
-from shapely.geometry import Polygon
+from shapely.geometry import Polygon, shape
 from .types import DetBox, GeoObject, TileRef, TileSemantics
 from .telemetry import get_tracer
+from .normalize import normalize_label, normalize_roof_color
 
 
 logger = logging.getLogger(__name__)
@@ -27,7 +28,7 @@ def poly_to_geojson(poly: Polygon) -> Dict[str, Any]:
     return {"type": "Polygon", "coordinates": [[list(p) for p in poly.exterior.coords]]}
 
 
-def iou_poly(a: Polygon, b: Polygon) -> float:
+def iou_poly(a, b) -> float:
     if not a.is_valid or not b.is_valid:
         return 0.0
     inter = a.intersection(b).area
@@ -49,7 +50,12 @@ class GeoAggregator:
             for d in dets:
                 a = ann_by_id.get(d.det_id)
                 label = a.label if a else (d.cls or "object")
-                attrs = a.attributes if a else {}
+                label = normalize_label(label)
+                attrs = dict(a.attributes) if a else {}
+                if "roof_color" in attrs:
+                    norm_color = normalize_roof_color(attrs.get("roof_color"))
+                    if norm_color:
+                        attrs["roof_color"] = norm_color
                 poly = px_bbox_to_geo_poly(d.bbox_px, tref)
                 obj_id = f"{tref.tile_id}_d{d.det_id}"
                 objs.append(GeoObject(
@@ -70,16 +76,33 @@ class GeoAggregator:
         with tracer.start_as_current_span("geo.nms") as span:
             if not objs:
                 return objs
-            polys = [Polygon(o.geometry["coordinates"][0]) for o in objs]
+            polys = []
+            for o in objs:
+                try:
+                    g = shape(o.geometry)
+                    if not g.is_valid:
+                        g = g.buffer(0)
+                    if g.is_empty:
+                        g = None
+                except Exception:
+                    g = None
+                polys.append(g)
             order = sorted(range(len(objs)), key=lambda i: objs[i].confidence, reverse=True)
             keep = []
             suppressed = set()
-            for i in order:
+            for pi, i in enumerate(order):
                 if i in suppressed:
                     continue
                 keep.append(i)
-                for j in order:
-                    if j <= i or j in suppressed:
+                for pj in range(pi + 1, len(order)):
+                    j = order[pj]
+                    if j in suppressed:
+                        continue
+                    if polys[i] is None or polys[j] is None:
+                        continue
+                    if polys[i].geom_type not in ("Polygon", "MultiPolygon"):
+                        continue
+                    if polys[j].geom_type not in ("Polygon", "MultiPolygon"):
                         continue
                     if objs[i].label != objs[j].label:
                         continue
@@ -87,3 +110,6 @@ class GeoAggregator:
                         suppressed.add(j)
             span.set_attribute("nms.kept", len(keep))
             return [objs[i] for i in keep]
+
+    def geo_nms_global(self, objs: List[GeoObject]) -> List[GeoObject]:
+        return self.geo_nms(objs)

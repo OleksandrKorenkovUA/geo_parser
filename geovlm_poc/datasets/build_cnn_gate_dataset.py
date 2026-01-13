@@ -25,6 +25,7 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from geovlm_poc.tiling import ImageTiler
+from geovlm_poc.geo_utils import require_projected_crs, strtree_query_geoms
 
 
 DEFAULT_RULES = [
@@ -206,7 +207,8 @@ def main():
         image_id = os.path.splitext(os.path.basename(img_path))[0]
         tiler = ImageTiler(tile_size=args.tile_size, overlap=args.overlap, bands=bands)
         with rasterio.open(img_path) as ds:
-            dst_crs = ds.crs or CRS.from_string(args.osm_crs)
+            dst_crs = ds.crs
+        require_projected_crs(dst_crs, "GeoTIFF")
 
         pos_tree = None
         pos_geoms = []
@@ -229,7 +231,7 @@ def main():
             intersect_ratio = 0.0
             is_pos = False
             if pos_tree:
-                candidates = pos_tree.query(tile_poly)
+                candidates = strtree_query_geoms(pos_tree, pos_geoms, tile_poly)
                 for g in candidates:
                     inter = tile_poly.intersection(g)
                     if not inter.is_empty:
@@ -246,7 +248,7 @@ def main():
                 near_pos = False
                 if pos_tree and args.neg_buffer > 0:
                     buf = tile_poly.buffer(args.neg_buffer)
-                    if pos_tree.query(buf):
+                    if strtree_query_geoms(pos_tree, pos_geoms, buf):
                         near_pos = True
                 if near_pos and not args.keep_ambiguous:
                     continue

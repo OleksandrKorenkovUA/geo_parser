@@ -1,12 +1,13 @@
 import os, json, asyncio, logging
 from typing import Optional
 from .tiling import ImageTiler
-from .gates import HeuristicGate, CLIPGate, CNNGate
+from .gates import HeuristicGate, CLIPGate, CNNGate, NoopGate
 from .detector import YOLODetector
 from .vlm import VLMAnnotator
 from .geo import GeoAggregator
 from .pipeline import TileCache, process_image, load_geoobjects_jsonl
 from .change import Coregistrator, ChangeDetector
+from .geo_utils import require_projected_crs
 from .semantic_index import EmbeddingClient, VectorIndex, SemanticSearcher, build_semantic_index
 from .telemetry import init_logging, init_tracing, get_tracer
 
@@ -39,6 +40,9 @@ def _parse_prompt_list(value: str, fallback):
 
 def _build_gate():
     g = os.environ.get("GATE", "heuristic").strip().lower()
+    if g == "none":
+        logger.info("Gate selection: none")
+        return NoopGate()
     if g == "clip":
         keep_default = ["dense urban area", "buildings and roads", "parking lot with many cars", "industrial site"]
         drop_default = ["forest", "agricultural field", "water surface", "clouds"]
@@ -85,9 +89,12 @@ async def cmd_analyze(a_path: str, b_path: str, out_dir: str):
                            overlap=int(os.environ.get("OVERLAP", "256")))
         gate = _build_gate()
         detector = YOLODetector(model_path=os.environ.get("YOLO_MODEL", "yolo12n.pt"),
-                                conf=float(os.environ.get("YOLO_CONF", "0.25")))
+                                conf=float(os.environ.get("YOLO_CONF", "0.25")),
+                                max_det=int(os.environ.get("YOLO_MAX_DET", "400")),
+                                device=os.environ.get("YOLO_DEVICE", "cpu"))
         aggregator = GeoAggregator(nms_iou=float(os.environ.get("NMS_IOU", "0.6")))
         cache = TileCache(os.path.join(out_dir, "cache"))
+        max_inflight = int(os.environ.get("MAX_INFLIGHT_TILES", "32"))
 
         base_url = _require_env("VLM_BASE_URL")
         api_key = _require_env("VLM_API_KEY")
@@ -102,8 +109,15 @@ async def cmd_analyze(a_path: str, b_path: str, out_dir: str):
         try:
             out_a = os.path.join(out_dir, "a.objects.jsonl")
             out_b = os.path.join(out_dir, "b.objects.jsonl")
-            a_id, crs_wkt, a_objs = await process_image(a_path, out_a, tiler, gate, detector, vlm, cache, aggregator)
-            b_id, _, b_objs = await process_image(b_path, out_b, tiler, gate, detector, vlm, cache, aggregator)
+            a_id, crs_wkt, a_objs = await process_image(
+                a_path, out_a, tiler, gate, detector, vlm, cache, aggregator, max_inflight=max_inflight
+            )
+            b_id, _, b_objs = await process_image(
+                b_path, out_b, tiler, gate, detector, vlm, cache, aggregator, max_inflight=max_inflight
+            )
+            if not crs_wkt:
+                raise RuntimeError("GeoTIFF CRS is missing; distance buffers require projected CRS in meters.")
+            require_projected_crs(crs_wkt, "Change detection")
 
             cd = ChangeDetector(iou_match=float(os.environ.get("MATCH_IOU", "0.35")),
                                 buffer_tol=float(os.environ.get("BUFFER_TOL", "4.0")),
@@ -132,9 +146,12 @@ async def cmd_analyze_single(image_path: str, out_dir: str):
                            overlap=int(os.environ.get("OVERLAP", "256")))
         gate = _build_gate()
         detector = YOLODetector(model_path=os.environ.get("YOLO_MODEL", "yolo12n.pt"),
-                                conf=float(os.environ.get("YOLO_CONF", "0.25")))
+                                conf=float(os.environ.get("YOLO_CONF", "0.25")),
+                                max_det=int(os.environ.get("YOLO_MAX_DET", "400")),
+                                device=os.environ.get("YOLO_DEVICE", "cpu"))
         aggregator = GeoAggregator(nms_iou=float(os.environ.get("NMS_IOU", "0.6")))
         cache = TileCache(os.path.join(out_dir, "cache"))
+        max_inflight = int(os.environ.get("MAX_INFLIGHT_TILES", "32"))
 
         base_url = _require_env("VLM_BASE_URL")
         api_key = _require_env("VLM_API_KEY")
@@ -144,14 +161,16 @@ async def cmd_analyze_single(image_path: str, out_dir: str):
 
         try:
             out_path = os.path.join(out_dir, "objects.jsonl")
-            await process_image(image_path, out_path, tiler, gate, detector, vlm, cache, aggregator)
+            await process_image(image_path, out_path, tiler, gate, detector, vlm, cache, aggregator,
+                                max_inflight=max_inflight)
             logger.info("Analyze single output objects=%s", out_path)
             print(out_path)
         finally:
             await vlm.close()
 
 
-def cmd_build_index(objects_jsonl: str, out_index_dir: str, change_report_json: Optional[str], rail_geojson: Optional[str]):
+def cmd_build_index(objects_jsonl: str, out_index_dir: str, change_report_json: Optional[str],
+                    rail_geojson: Optional[str], tile_manifest_jsonl: Optional[str], crs_wkt: Optional[str]):
     with tracer.start_as_current_span("cmd.build_index") as span:
         span.set_attribute("input.objects", objects_jsonl)
         span.set_attribute("output.index_dir", out_index_dir)
@@ -161,12 +180,15 @@ def cmd_build_index(objects_jsonl: str, out_index_dir: str, change_report_json: 
             _require_file(change_report_json, "Change report")
         if rail_geojson:
             _require_file(rail_geojson, "Rail GeoJSON")
+        if tile_manifest_jsonl:
+            _require_file(tile_manifest_jsonl, "Tile manifest")
         base_url = _require_env("EMB_BASE_URL")
         api_key = _require_env("EMB_API_KEY")
         model = os.environ.get("EMB_MODEL", "text-embedding-3-large")
         emb = EmbeddingClient(base_url=base_url, api_key=api_key, model=model)
         try:
-            p = build_semantic_index(objects_jsonl, out_index_dir, emb, change_report_json=change_report_json, rail_geojson=rail_geojson)
+            p = build_semantic_index(objects_jsonl, out_index_dir, emb, change_report_json=change_report_json,
+                                     rail_geojson=rail_geojson, tile_manifest_jsonl=tile_manifest_jsonl, crs_wkt=crs_wkt)
             logger.info("Build index output index_dir=%s", p)
             print(p)
         finally:
@@ -217,6 +239,8 @@ def main():
     bi.add_argument("--out-index", required=True)
     bi.add_argument("--changes", default=None)
     bi.add_argument("--rail", default=None)
+    bi.add_argument("--tiles-manifest", default=None)
+    bi.add_argument("--crs-wkt", default=None)
 
     s = sub.add_parser("search")
     s.add_argument("--index", required=True)
@@ -229,7 +253,7 @@ def main():
     elif args.cmd == "analyze-single":
         asyncio.run(cmd_analyze_single(args.image, args.out))
     elif args.cmd == "build-index":
-        cmd_build_index(args.objects, args.out_index, args.changes, args.rail)
+        cmd_build_index(args.objects, args.out_index, args.changes, args.rail, args.tiles_manifest, args.crs_wkt)
     elif args.cmd == "search":
         cmd_search(args.index, args.q)
 

@@ -45,15 +45,38 @@ class VLMAnnotator:
             }
             headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
             url = f"{self.base_url}/chat/completions"
-            async with self.sem:
-                r = await self.client.post(url, headers=headers, json=payload)
-            r.raise_for_status()
-            content = r.json()["choices"][0]["message"]["content"]
-            data = self._load_json_strict(content)
-            sem = TileSemantics.model_validate(data)
-            logger.info("VLM annotate done tile=%s annotations=%s elapsed_s=%.3f",
-                        tile_id, len(sem.annotations), time.perf_counter() - t0)
-            return sem
+            backoffs = [0.5, 1.5]
+            attempts = len(backoffs) + 1
+            for attempt in range(attempts):
+                try:
+                    async with self.sem:
+                        r = await self.client.post(url, headers=headers, json=payload)
+                    if r.status_code >= 500 or r.status_code == 429:
+                        if attempt < attempts - 1:
+                            logger.warning("VLM retry status=%s attempt=%s tile=%s", r.status_code, attempt + 1, tile_id)
+                            await asyncio.sleep(backoffs[attempt])
+                            continue
+                    r.raise_for_status()
+                    content = r.json()["choices"][0]["message"]["content"]
+                    data = self._load_json_strict(content)
+                    sem = TileSemantics.model_validate(data)
+                    logger.info("VLM annotate done tile=%s annotations=%s elapsed_s=%.3f",
+                                tile_id, len(sem.annotations), time.perf_counter() - t0)
+                    return sem
+                except (json.JSONDecodeError, ValueError, httpx.TimeoutException) as exc:
+                    if attempt < attempts - 1:
+                        logger.warning("VLM retry parse/timeout attempt=%s tile=%s err=%s", attempt + 1, tile_id, exc)
+                        await asyncio.sleep(backoffs[attempt])
+                        continue
+                    raise
+                except httpx.HTTPStatusError as exc:
+                    status = exc.response.status_code if exc.response is not None else None
+                    if status in (429,) or (status is not None and status >= 500):
+                        if attempt < attempts - 1:
+                            logger.warning("VLM retry http status=%s attempt=%s tile=%s", status, attempt + 1, tile_id)
+                            await asyncio.sleep(backoffs[attempt])
+                            continue
+                    raise
 
     def _prompt(self, tile_id: str, dets: List[DetBox], class_counts: Dict[str, int]) -> str:
         det_list = [{"det_id": d.det_id, "bbox_px": list(d.bbox_px), "det_score": d.score, "det_cls": d.cls} for d in dets]
@@ -73,10 +96,45 @@ class VLMAnnotator:
 
     def _load_json_strict(self, s: str) -> Dict[str, Any]:
         s = (s or "").strip()
-        if s.startswith("```"):
-            s = s.strip("`")
-            s = s.replace("json\n", "", 1).strip()
-        return json.loads(s)
+        if not s:
+            raise ValueError("Empty VLM response")
+        try:
+            return json.loads(s)
+        except json.JSONDecodeError:
+            pass
+        try:
+            snippet = self._extract_first_json_object(s)
+            return json.loads(snippet)
+        except Exception:
+            logger.debug("VLM JSON parse failed content=%r", s)
+            raise
+
+    def _extract_first_json_object(self, s: str) -> str:
+        start = s.find("{")
+        if start < 0:
+            raise ValueError("No JSON object start")
+        depth = 0
+        in_str = False
+        escape = False
+        for i in range(start, len(s)):
+            ch = s[i]
+            if in_str:
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == "\"":
+                    in_str = False
+                continue
+            if ch == "\"":
+                in_str = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return s[start:i + 1]
+        raise ValueError("No complete JSON object found")
 
     def _to_png_b64(self, rgb: np.ndarray) -> str:
         im = Image.fromarray(rgb, mode="RGB")

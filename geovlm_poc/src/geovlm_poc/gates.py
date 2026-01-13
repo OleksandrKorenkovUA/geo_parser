@@ -15,6 +15,14 @@ class TileGate:
         raise NotImplementedError
 
 
+class NoopGate(TileGate):
+    def keep(self, rgb: np.ndarray) -> Tuple[bool, Dict[str, float]]:
+        with tracer.start_as_current_span("gate.none") as span:
+            span.set_attribute("gate.ok", True)
+            logger.info("Gate none ok=True")
+            return True, {"gate": "none"}
+
+
 class HeuristicGate(TileGate):
     def __init__(self, min_score: float = 0.24, min_edge_density: float = 0.05, min_entropy: float = 3.2):
         self.min_score, self.min_edge_density, self.min_entropy = min_score, min_edge_density, min_entropy

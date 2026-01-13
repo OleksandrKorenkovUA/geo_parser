@@ -26,6 +26,7 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from geovlm_poc.tiling import ImageTiler
+from geovlm_poc.geo_utils import require_projected_crs, strtree_query_geoms
 
 
 LABEL_RULES = {
@@ -226,7 +227,8 @@ def main():
         image_id = os.path.splitext(os.path.basename(img_path))[0]
         tiler = ImageTiler(tile_size=args.tile_size, overlap=args.overlap, bands=bands)
         with rasterio.open(img_path) as ds:
-            dst_crs = ds.crs or CRS.from_string(args.osm_crs)
+            dst_crs = ds.crs
+        require_projected_crs(dst_crs, "GeoTIFF")
 
         src_crs = CRS.from_string(args.osm_crs)
         geoms, props = _load_osm_features(args.osm, src_crs, dst_crs)
@@ -240,10 +242,10 @@ def main():
             tile_area = tile_poly.area
             center = Point((minx + maxx) / 2.0, (miny + maxy) / 2.0)
             labels = []
-            for label, (tree, _) in label_indices.items():
+            for label, (tree, geoms) in label_indices.items():
                 if not tree:
                     continue
-                candidates = tree.query(tile_poly)
+                candidates = strtree_query_geoms(tree, geoms, tile_poly)
                 hit = False
                 for g in candidates:
                     inter = tile_poly.intersection(g)
@@ -259,14 +261,14 @@ def main():
 
             railway_near = False
             if "railway" in label_indices and args.near_buffer > 0:
-                tree, _ = label_indices["railway"]
-                if tree and tree.query(tile_poly.buffer(args.near_buffer)):
+                tree, geoms = label_indices["railway"]
+                if tree and strtree_query_geoms(tree, geoms, tile_poly.buffer(args.near_buffer)):
                     railway_near = True
 
             blue_ratio = 0.0
             blue_roof = False
             if args.blue_roof and bldg_tree:
-                candidates = bldg_tree.query(tile_poly)
+                candidates = strtree_query_geoms(bldg_tree, bldg_geoms, tile_poly)
                 if candidates:
                     affine = Affine(*tref.transform)
                     mask = rasterize(

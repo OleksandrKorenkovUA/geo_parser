@@ -15,10 +15,12 @@ class Detector:
 
 
 class YOLODetector(Detector):
-    def __init__(self, model_path: str = "yolo12n.pt", conf: float = 0.25, max_det: int = 400):
+    def __init__(self, model_path: str = "yolo12n.pt", conf: float = 0.25, max_det: int = 400,
+                 device: str = "cpu"):
         self.model_path = model_path
         self.conf = conf
         self.max_det = max_det
+        self.device = device
         self._model = None
 
     def _lazy(self):
@@ -30,7 +32,7 @@ class YOLODetector(Detector):
     def detect(self, rgb: np.ndarray) -> Tuple[List[DetBox], Dict[str, int]]:
         with tracer.start_as_current_span("detector.yolo") as span:
             self._lazy()
-            res = self._model.predict(rgb, conf=self.conf, max_det=self.max_det, verbose=False)[0]
+            res = self._model.predict(rgb, conf=self.conf, max_det=self.max_det, device=self.device, verbose=False)[0]
             boxes: List[DetBox] = []
             counts: Dict[str, int] = {}
             if res.boxes is None:

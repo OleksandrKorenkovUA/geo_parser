@@ -12,6 +12,7 @@ except Exception:
     STRtree = None
 from .types import ChangeEvent, ChangeReport, GeoObject
 from .geo import iou_poly, poly_to_geojson
+from .geo_utils import strtree_query_geoms
 from .telemetry import get_tracer
 
 
@@ -72,7 +73,7 @@ def _vehicle_group_sizes(objs: List[GeoObject], radius_m: float, vehicle_labels=
     tree = STRtree(pts)
     out = {}
     for o, p in zip(veh, pts):
-        cand = tree.query(p.buffer(radius_m))
+        cand = strtree_query_geoms(tree, pts, p.buffer(radius_m))
         cnt = 0
         for q in cand:
             if p.distance(q) <= radius_m:
@@ -95,6 +96,8 @@ class Coregistrator:
                 if da.crs and db.crs and da.crs != db.crs:
                     logger.warning("Coregistration CRS mismatch a=%s b=%s; returning zero shift", da.crs, db.crs)
                     return (0.0, 0.0)
+                if da.transform != db.transform:
+                    logger.warning("Coregistration transforms differ a=%s b=%s", da.transform, db.transform)
                 out_w, out_h = self._common_out_shape(da.width, da.height, db.width, db.height)
                 img_a = self._read_gray(da, out_h, out_w)
                 img_b = self._read_gray(db, out_h, out_w)
@@ -210,7 +213,7 @@ class ChangeDetector:
             used_b = set()
             for oa, pa in zip(a_objs, a_polys):
                 q = pa.buffer(self.buffer_tol) if self.buffer_tol > 0 else pa
-                cand = tree.query(q)
+                cand = strtree_query_geoms(tree, b_polys, q)
                 best = (-1.0, None)
                 for pb in cand:
                     j = b_idx.get(id(pb))

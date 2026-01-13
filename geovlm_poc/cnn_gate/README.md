@@ -1,20 +1,23 @@
-# CNN Gate Training (MobileNetV3-small)
+# Навчання CNN Gate (MobileNetV3-small)
 
-This folder contains scripts and notes for training a lightweight CNN gate that
-filters "interesting" vs "boring" tiles before expensive stages (YOLO/VLM/CLIP).
+У цій папці розміщені скрипти та інструкції для навчання полегшеного фільтра (CNN Gate), що відсіює "цікаві" та "нудні" тайли перед більш витратними етапами обробки (YOLO/VLM/CLIP).
 
-## 1) Define the labels
+---
 
-"Interesting" tiles are those worth passing to the next stage, for example:
-- urban areas, roads, railways, industrial sites, ports, quarries
-- dense infrastructure and structured patterns
+## 1) Визначення класів
 
-"Boring" tiles are mostly uniform:
-- fields, forests without structure, water, clouds/fog, empty plains
+**"Цікаві" (interesting) тайли** — це ті, які слід передати на наступний етап. Приклади:
+- міські території, дороги, залізниці, промислові зони, порти, кар’єри;
+- щільна інфраструктура, структуровані візерунки.
 
-The goal is high recall for "interesting" tiles, not perfect accuracy.
+**"Нудні" (boring) тайли** зазвичай однорідні:
+- поля, ліси без структури, вода, хмари/туман, пусті рівнини.
 
-## 2) Dataset layout (ImageFolder)
+**Мета:** досягти високої повноти (recall) для "цікавих" зображень. Точність (accuracy) не є пріоритетом.
+
+---
+
+## 2) Структура датасету (ImageFolder)
 
 ```
 data_cnn_gate/
@@ -31,11 +34,14 @@ data_cnn_gate/
     boring/
 ```
 
-Class names are important: `interesting` is treated as the positive class.
+Назви класів мають значення: `interesting` — це позитивний клас.
 
-## 2.1) Build the dataset from GeoTIFF + OSM
+---
 
-If you have OSM GeoJSON, you can create weak labels automatically:
+## 2.1) Автоматичне формування датасету з GeoTIFF + OSM
+
+Якщо маєте OSM у форматі GeoJSON, можна автоматично згенерувати слабкі розмітки:
+
 ```
 python geovlm_poc/datasets/build_cnn_gate_dataset.py \
   --image /path/to/scene.tif \
@@ -43,36 +49,78 @@ python geovlm_poc/datasets/build_cnn_gate_dataset.py \
   --out data_cnn_gate
 ```
 
-## 3) Train the model
+- `--image` — шлях до геотіфа сцени;
+- `--osm` — шлях до OSM (GeoJSON);
+- `--out` — вихідна папка для датасету.
+
+---
+
+## 3) Навчання моделі
+
+Навчіть модель командою:
 
 ```
 python geovlm_poc/cnn_gate/train_cnn_gate.py --data data_cnn_gate --out cnn_gate_mnv3s.pt --epochs 10 --device cuda
 ```
 
-This saves a `state_dict` that matches `CNNGate` in the pipeline.
+- Файл `cnn_gate_mnv3s.pt` буде збережено як state_dict.
+- Переконайтесь, що для тренування використовується розмір зображення 224, щоб він співпадав з розміром під час інференсу.
+- Якщо у вас немає GPU, приберіть `--device cuda`.
 
-## 4) Pick a threshold (CNN_GATE_THR)
+Контроль навчання:
+- Можна змінювати кількість епох через параметр `--epochs`.
+- Для передачі власних гіперпараметрів скористайтесь `--batch-size`, `--lr` (learning rate), `--wd` (weight decay).
+
+---
+
+## 4) Підбір порогу детектування (CNN_GATE_THR)
+
+Запустіть підбір порогу, що забезпечує бажану повноту:
 
 ```
 python geovlm_poc/cnn_gate/pick_thr.py --data data_cnn_gate --ckpt cnn_gate_mnv3s.pt --split val --target_recall 0.98
 ```
 
-The script searches thresholds and reports:
-- best F1
-- lowest pass rate that still meets target recall
+Скрипт перебирає пороги і показує:
+- найкращий F1;
+- мінімальний pass rate із досягнутою заданою повнотою.
 
-## 5) Wire it into the pipeline
+**Рекомендації:**
+- Підбирайте поріг на валідаційній або тестовій вибірці.
+- Результат порога підставте у змінну oточення для інференсу.
 
-In `.env`:
+---
+
+## 5) Інтеграція у пайплайн
+
+Додайте у файл `.env`:
+
 ```
 CNN_GATE_CKPT=/abs/path/to/cnn_gate_mnv3s.pt
 CNN_GATE_THR=0.32
 CNN_DEVICE=cuda:0
 ```
 
-## Notes
+**Примітки:**
+- `CNN_GATE_CKPT` — абсолютний шлях до збереженої моделі.
+- `CNN_GATE_THR` — поріг, підібраний на кроці 4.
+- `CNN_DEVICE` — пристрій для інференсу (`cuda`, `cuda:0` або `cpu`).
 
-- The gate uses MobileNetV3-small with a single-logit head.
-- Inference in `CNNGate` uses resize to 224x224 + ImageNet normalization.
-- Keep the training `imgsz` at 224 to match inference.
-- If you change the architecture, the `state_dict` will not load.
+---
+
+## Додаткові інструкції
+
+- Модель використовує MobileNetV3-small із однією логітною головою (1 вихід).
+- Для інференсу використовується зміна розміру до 224x224 та нормалізація як для ImageNet.
+- Якщо хочете змінити архітектуру моделі, потрібно буде перенавчити і підібрати новий state_dict.
+- Для перевірки моделі на тесті використовуйте:
+  ```
+  python geovlm_poc/cnn_gate/pick_thr.py --data data_cnn_gate --ckpt cnn_gate_mnv3s.pt --split test --target_recall 0.98
+  ```
+- Переконайтесь, що у всіх підпапках є приклади для кожного класу, інакше ImageFolder може падати.
+- Якщо виникли труднощі – перевірте, чи правильно задані імена класів у структурі папок (`interesting`, `boring`).
+- Для аналізу точності використайте також додаткові метрики (`precision`, `recall`, `f1`), що виводяться скриптом під час підбору порогу.
+- Ви можете візуалізувати "цікаві"/"нудні" тайли для перевірки якості та коректності розмітки.
+
+---
+

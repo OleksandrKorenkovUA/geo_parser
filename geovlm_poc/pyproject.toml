@@ -20,6 +20,7 @@ yolo = ["ultralytics"]
 clip = ["open_clip_torch", "torch"]
 cnn = ["torch", "torchvision"]
 faiss = ["faiss-cpu"]
+ui = ["streamlit", "folium", "streamlit-folium", "pyproj"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

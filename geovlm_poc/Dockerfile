@@ -13,11 +13,13 @@ RUN apt-get update \
 
 COPY . .
 
-ARG PIP_EXTRAS=""
+ARG PIP_EXTRAS="ui"
 RUN if [ -n "$PIP_EXTRAS" ]; then \
         pip install --no-cache-dir .[${PIP_EXTRAS}]; \
     else \
         pip install --no-cache-dir .; \
     fi
 
-ENTRYPOINT ["geovlm-poc"]
+EXPOSE 8501
+
+CMD ["streamlit", "run", "streamlit_app.py", "--server.address=0.0.0.0", "--server.port=8501"]
