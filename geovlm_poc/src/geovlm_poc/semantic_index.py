@@ -255,7 +255,7 @@ def compute_rail_dist_m(geom: Dict[str, Any], rail_union) -> Optional[float]:
 class EmbeddingClient:
     def __init__(self, base_url: str, api_key: str, model: str, timeout_s: float = 60.0):
         self.base_url = base_url.rstrip("/")
-        self.api_key = api_key
+        self.api_key = (api_key or "").strip()
         self.model = model
         self.client = httpx.Client(timeout=timeout_s)
         logger.info("Embedding client init base_url=%s model=%s timeout_s=%s", self.base_url, self.model, timeout_s)
@@ -265,7 +265,9 @@ class EmbeddingClient:
             span.set_attribute("batch.size", len(texts))
             t0 = time.perf_counter()
             url = f"{self.base_url}/embeddings"
-            headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
+            headers = {"Content-Type": "application/json"}
+            if self.api_key:
+                headers["Authorization"] = f"Bearer {self.api_key}"
             payload = {"model": self.model, "input": texts}
             r = self.client.post(url, headers=headers, json=payload)
             r.raise_for_status()

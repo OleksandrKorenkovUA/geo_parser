@@ -170,8 +170,20 @@ def main():
 
     keep_ds = TileDataset(keep_paths, preprocess)
     drop_ds = TileDataset(drop_paths, preprocess)
-    keep_dl = DataLoader(keep_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.workers)
-    drop_dl = DataLoader(drop_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.workers)
+    keep_dl = DataLoader(
+        keep_ds,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.workers,
+        pin_memory=use_cuda,
+    )
+    drop_dl = DataLoader(
+        drop_ds,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.workers,
+        pin_memory=use_cuda,
+    )
 
     keep_scores, keep_sim, drop_sim, keep_out_paths = _collect_scores(
         model, keep_text, drop_text, keep_dl, device

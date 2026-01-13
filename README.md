@@ -46,7 +46,7 @@ pip install -e ".[ui]"
 Скопіюйте приклад та заповніть значення:
 
 ```bash
-cp .env.example .env
+cp geovlm_poc/.env.example geovlm_poc/.env
 ```
 
 Обов’язкові змінні:
@@ -73,13 +73,142 @@ EMB_MODEL=multilingual-embeddings
 
 Примітка: цей PoC працює напряму з OpenAI-сумісними `/chat/completions` і `/embeddings` ендпоінтами, тому достатньо вказати `.../v1` як base URL.
 
+### Сценарій встановлення та застосування (покроково)
+
+1) **Створіть Python-оточення і встановіть залежності**
+
+Мінімально:
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -U pip
+pip install -e .
+```
+
+З опційними модулями (YOLO/CLIP/CNN/FAISS/UI):
+```bash
+pip install -e ".[yolo,clip,cnn,faiss,ui]"
+```
+
+2) **Налаштуйте змінні оточення**
+
+```bash
+cp geovlm_poc/.env.example geovlm_poc/.env
+```
+
+Відредагуйте `geovlm_poc/.env` і підвантажте:
+```bash
+set -a
+source geovlm_poc/.env
+set +a
+```
+
+Порада: якщо VLM/Embeddings не вимагають авторизації, задайте `VLM_API_KEY=DUMMY_KEY` і `EMB_API_KEY=DUMMY_KEY`.
+
+3) **Запустіть аналіз (дві дати)**
+
+```bash
+geovlm-poc analyze --a /data/dateA.tif --b /data/dateB.tif --out ./out_run
+```
+
+Очікувані артефакти:
+- `./out_run/a.objects.jsonl`
+- `./out_run/b.objects.jsonl`
+- `./out_run/change_report.json`
+
+4) **Запустіть аналіз однієї дати (якщо треба)**
+
+```bash
+geovlm-poc analyze-single --image /data/dateA.tif --out ./out_run_single
+```
+
+Артефакт:
+- `./out_run_single/objects.jsonl`
+
+5) **Побудуйте семантичний індекс**
+
+```bash
+geovlm-poc build-index --objects ./out_run/a.objects.jsonl --out-index ./out_run/index_a --changes ./out_run/change_report.json
+```
+
+6) **Виконайте пошук**
+
+```bash
+geovlm-poc search --index ./out_run/index_a --q "find warehouses with blue roofs near railway"
+```
+
+### Варіанти використання (корисні комбінації)
+
+**Gate**
+
+- Вимкнути gate (для дебагу або максимальної повноти):
+```bash
+GATE=none geovlm-poc analyze --a /data/dateA.tif --b /data/dateB.tif --out ./out_run
+```
+
+- CLIP gate з власними промптами:
+```bash
+GATE=clip CLIP_DEVICE=cuda CLIP_GATE_THR=0.18 \
+CLIP_KEEP_PROMPTS="dense urban area|industrial site|parking lot" \
+CLIP_DROP_PROMPTS="forest|water|clouds" \
+geovlm-poc analyze --a /data/dateA.tif --b /data/dateB.tif --out ./out_run
+```
+
+- CNN gate (вкажіть чекпойнт):
+```bash
+GATE=cnn CNN_GATE_CKPT=/models/cnn_gate.pt CNN_GATE_THR=0.6 CNN_DEVICE=cuda \
+geovlm-poc analyze --a /data/dateA.tif --b /data/dateB.tif --out ./out_run
+```
+
+**YOLO**
+
+- Інша модель + нижчий поріг:
+```bash
+YOLO_MODEL=yolo12s.pt YOLO_CONF=0.15 YOLO_DEVICE=cuda \
+geovlm-poc analyze --a /data/dateA.tif --b /data/dateB.tif --out ./out_run
+```
+
+**Тайли**
+
+- Змінити розмір/перекриття (впливає на баланс швидкість/точність):
+```bash
+TILE_SIZE=768 OVERLAP=192 \
+geovlm-poc analyze --a /data/dateA.tif --b /data/dateB.tif --out ./out_run
+```
+
+**Індекс**
+
+- Додати залізничний шар для фільтрів:
+```bash
+geovlm-poc build-index --objects ./out_run/a.objects.jsonl --out-index ./out_run/index_a \
+  --changes ./out_run/change_report.json --rail ./data/railways.geojson
+```
+
+## Навчання CNN/CLIP gate та підготовка датасетів
+
+Окремий гайд з прикладами команд знаходиться тут: `geovlm_poc/README_TRAINING.md`.
+
 Пояснення ключових параметрів:
 - `TILE_SIZE`, `OVERLAP`: розмір тайла і перекриття.
 - `GATE`: режим фільтрації (`heuristic|clip|cnn`).
 - `CLIP_KEEP_PROMPTS`, `CLIP_DROP_PROMPTS`, `CLIP_GATE_THR`, `CLIP_MODEL`, `CLIP_PRETRAINED`, `CLIP_DEVICE`: промпти, поріг і модель CLIP для gate.
 - `YOLO_MODEL`, `YOLO_CONF`: модель і поріг детекції.
+- `DETECTOR_WORKERS`, `VLM_WORKERS`: паралельність стадій детектора/VLM у пайплайні.
 - `MATCH_IOU`, `BUFFER_TOL`: пороги для change detection.
 - `TOP_K`: кількість результатів пошуку.
+- `VLM_MODE`: режим structured output для VLM (`free_text|json|choice`).
+- `VLM_JSON_SCHEMA`: JSON-схема для `VLM_MODE=json` (якщо не задано — використовується вбудована).
+- `VLM_CHOICE_LIST`: список дозволених відповідей для `VLM_MODE=choice` (розділювач `|` або `,`).
+- `VLM_LOG_PAYLOAD`: `1/true` щоб логувати фактичний payload (картинка редагується).
+- `VLM_BACKEND`: формат multimodal payload (`openai|vllm_qwen`).
+- `VLM_MAX_IMAGE_SIDE`: максимальна сторона зображення для VLM (0 = без зменшення).
+- `VLM_TIMEOUT_READ`: read timeout для VLM запиту (секунди).
+- `VLM_TIMEOUT_CONNECT`, `VLM_TIMEOUT_WRITE`, `VLM_TIMEOUT_POOL`: розширені таймаути httpx (секунди).
+- `VLM_IMAGE_MODE`: спосіб передачі зображень у VLM (`base64|url|path`).
+- `VLM_IMAGE_URL_PREFIX`, `VLM_IMAGE_URL_ROOT`: префікс/корінь для побудови URL, якщо `VLM_IMAGE_MODE=url`.
+- `CACHE_KEY_MODE`: режим ключа кешу (`tile|pixels|source`).
+- `ALLOW_EMPTY_VLM`: якщо `1`, VLM запускається навіть коли `YOLO` не дав детекцій.
+- Примітка: якщо `ALLOW_EMPTY_VLM=1` і є ризик зміни детекцій між запуском, встановіть `CACHE_KEY_MODE=source`, щоб кеш враховував dets.
 
 ### CLIP Gate: як писати промпти
 
@@ -190,6 +319,11 @@ UI підтримує три сценарії: Analyze (запуск аналі�
 - Якщо немає `ultralytics`, `open_clip_torch` або `faiss`, встановіть відповідні extras.
 - Для `GATE=clip` потрібні `open_clip_torch` і `torch`.
 - Для `GATE=cnn` потрібні `torch`, `torchvision` і чекпойнт `CNN_GATE_CKPT`.
+- `400 Bad Request` із повідомленням про `structured outputs` означає, що одночасно передано кілька взаємовиключних режимів (`json|regex|choice`). Встановіть **один** режим через `VLM_MODE` або вимкніть structured output (`VLM_MODE=free_text`).
+- Для діагностики увімкніть логування payload: `VLM_LOG_PAYLOAD=1` і перевірте, що у запиті є лише один constraint.
+- Для vLLM + Qwen3‑VL використовуйте `VLM_BACKEND=vllm_qwen` — зображення передається через `mm_processor_kwargs.images`, а не як `image_url` у `messages`.
+- `httpx.ReadError` під навантаженням означає backpressure/overload. Рекомендації: `VLM_CONCURRENCY=1`, `VLM_MAX_IMAGE_SIDE=512|768`, `VLM_TIMEOUT_READ=120`.
+- Якщо `VLM_IMAGE_MODE=url|path`, пайплайн автоматично вмикає збереження PNG тайлів (потрібно, щоб VLM мав доступ до файлів/URL).
 
 ## Рекомендовані налаштування для щільної міської забудови
 

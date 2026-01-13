@@ -22,10 +22,10 @@ class TileCache:
         self.dir = dir_path
         self.enabled = True
         os.makedirs(self.dir, exist_ok=True)
-        self.key_mode = os.environ.get("CACHE_KEY_MODE", "pixels").strip().lower()
-        if self.key_mode not in {"pixels", "source"}:
-            logger.warning("Unknown CACHE_KEY_MODE=%s; defaulting to pixels", self.key_mode)
-            self.key_mode = "pixels"
+        self.key_mode = os.environ.get("CACHE_KEY_MODE", "tile").strip().lower()
+        if self.key_mode not in {"pixels", "source", "tile"}:
+            logger.warning("Unknown CACHE_KEY_MODE=%s; defaulting to tile", self.key_mode)
+            self.key_mode = "tile"
         self.max_files = int(os.environ.get("CACHE_MAX_FILES", "0")) or None
         self.max_mb = float(os.environ.get("CACHE_MAX_MB", "0") or 0.0) or None
         self.prune_every = max(1, int(os.environ.get("CACHE_PRUNE_EVERY", "25")))
@@ -42,7 +42,7 @@ class TileCache:
             if not dets_hash:
                 raise ValueError("dets_hash required for CACHE_KEY_MODE=source")
             h.update(dets_hash.encode("utf-8"))
-        else:
+        elif self.key_mode == "pixels":
             mv = memoryview(rgb)
             if not mv.contiguous:
                 mv = memoryview(np.ascontiguousarray(rgb))
@@ -138,6 +138,15 @@ def _hash_dets(dets: List[DetBox]) -> str:
     return h.hexdigest()
 
 
+def _hash_rgb(rgb: np.ndarray) -> str:
+    h = hashlib.sha256()
+    mv = memoryview(rgb)
+    if not mv.contiguous:
+        mv = memoryview(np.ascontiguousarray(rgb))
+    h.update(mv)
+    return h.hexdigest()
+
+
 def _normalize_semantics(sem: TileSemantics) -> None:
     for ann in sem.annotations:
         ann.label = normalize_label(ann.label)
@@ -182,9 +191,14 @@ async def process_image(path: str, out_jsonl: str,
         logger.info("Process image start image=%s tiles=%s out=%s max_inflight=%s",
                     image_id, len(tile_refs), out_jsonl, max_inflight)
 
-        sem = asyncio.Semaphore(max_inflight)
         offload_cpu = _env_flag("ASYNC_OFFLOAD_CPU", default=False)
+        image_mode = os.environ.get("VLM_IMAGE_MODE", "base64").strip().lower()
         cache_enabled = bool(getattr(cache, "enabled", True))
+        if image_mode in {"url", "path"} and not save_tiles:
+            save_tiles = True
+            if not tiles_dir:
+                tiles_dir = os.path.join(os.path.dirname(out_jsonl) or ".", "tiles")
+            logger.info("VLM image mode=%s requires tile PNGs; enabling save_tiles tiles_dir=%s", image_mode, tiles_dir)
         if save_tiles and not tiles_dir:
             tiles_dir = os.path.join(os.path.dirname(out_jsonl) or ".", "tiles")
         tile_img_dir = os.path.join(tiles_dir, image_id) if (save_tiles and tiles_dir) else None
@@ -205,6 +219,18 @@ async def process_image(path: str, out_jsonl: str,
             "cache_hits": 0,
             "cache_misses": 0,
         }
+        detector_workers = max(1, int(os.environ.get("DETECTOR_WORKERS", "4")))
+        vlm_workers = max(1, int(os.environ.get("VLM_WORKERS", "4")))
+        detector_workers = min(detector_workers, max_inflight)
+        vlm_workers = min(vlm_workers, max_inflight)
+        tile_queue = asyncio.Queue(maxsize=max_inflight)
+        vlm_queue = asyncio.Queue(maxsize=max_inflight)
+        objs = []
+        objs_lock = asyncio.Lock()
+        detector_model = getattr(detector, "model_path", None)
+        gate_name = type(gate).__name__
+        vlm_model = getattr(vlm, "model", None)
+        vlm_prompt_id = getattr(vlm, "prompt_id", None)
 
         def _relpath(p: Optional[str]) -> Optional[str]:
             if not p or not tile_manifest_path:
@@ -231,8 +257,66 @@ async def process_image(path: str, out_jsonl: str,
                 payload.update(extra)
             progress_cb(payload)
 
-        async def handle(tref: TileRef):
-            async with sem:
+        async def _finalize_tile(
+            tref: TileRef,
+            gate_ok: bool,
+            metrics: Dict[str, float],
+            class_counts: Dict[str, int],
+            dets: List[DetBox],
+            cache_hit: Optional[bool],
+            status: str,
+            png_path: Optional[str],
+            sem_tile: Optional[TileSemantics],
+            tile_hash: Optional[str],
+            prompt_id: Optional[str],
+            geo: Optional[List[GeoObject]] = None,
+        ) -> None:
+            if geo:
+                async with objs_lock:
+                    objs.extend(geo)
+            entry = {
+                "image_id": tref.image_id,
+                "tile_id": tref.tile_id,
+                "row": tref.row,
+                "col": tref.col,
+                "window": list(tref.window),
+                "bounds": list(tref.bounds),
+                "transform": list(tref.transform),
+                "crs_wkt": tref.crs_wkt,
+                "gate_ok": gate_ok,
+                "gate_metrics": metrics,
+                "class_counts": class_counts,
+                "dets": [d.model_dump() for d in dets] if dets else [],
+                "cache_hit": cache_hit,
+                "status": status,
+                "png_path": _relpath(png_path),
+                "semantics": sem_tile.model_dump() if sem_tile else None,
+                "tile_hash": tile_hash,
+                "prompt_id": prompt_id,
+                "detector_model": detector_model,
+                "vlm_model": vlm_model,
+                "vlm_prompt_id": vlm_prompt_id,
+                "gate_name": gate_name,
+            }
+            await _write_manifest(entry)
+            async with progress_lock:
+                progress["processed_tiles"] += 1
+                if gate_ok:
+                    progress["kept_tiles"] += 1
+                progress["dets_total"] += len(dets)
+                if cache_enabled and cache_hit is not None:
+                    if cache_hit:
+                        progress["cache_hits"] += 1
+                    else:
+                        progress["cache_misses"] += 1
+            await _emit_progress("tile", {"tile_id": tref.tile_id, "status": status})
+
+        async def _detector_worker():
+            while True:
+                tref = await tile_queue.get()
+                if tref is None:
+                    tile_queue.task_done()
+                    break
                 gate_ok = False
                 dets: List[DetBox] = []
                 class_counts: Dict[str, int] = {}
@@ -241,6 +325,8 @@ async def process_image(path: str, out_jsonl: str,
                 sem_tile: Optional[TileSemantics] = None
                 png_path = None
                 status = "error"
+                tile_hash = None
+                key = ""
                 try:
                     with tracer.start_as_current_span("tile.handle") as tspan:
                         tspan.set_attribute("tile.id", tref.tile_id)
@@ -248,6 +334,7 @@ async def process_image(path: str, out_jsonl: str,
                         t0 = time.perf_counter()
                         logger.info("Tile start image=%s tile=%s window=%s", tref.image_id, tref.tile_id, tref.window)
                         rgb = tiler.read_tile_rgb(path, tref)
+                        tile_hash = _hash_rgb(rgb)
                         logger.info("Tile read tile=%s shape=%s", tref.tile_id, rgb.shape)
                         if offload_cpu:
                             ok, metrics = await asyncio.to_thread(gate.keep, rgb)
@@ -258,7 +345,11 @@ async def process_image(path: str, out_jsonl: str,
                             tspan.set_attribute("tile.skipped", True)
                             logger.info("Tile skipped by gate tile=%s", tref.tile_id)
                             status = "skipped_gate"
-                            return []
+                            await _finalize_tile(
+                                tref, gate_ok, metrics, class_counts, dets, cache_hit, status,
+                                png_path, sem_tile, tile_hash, None, None
+                            )
+                            continue
                         gate_ok = True
                         if tile_img_dir:
                             png_path = os.path.join(tile_img_dir, f"{tref.tile_id}.png")
@@ -272,68 +363,108 @@ async def process_image(path: str, out_jsonl: str,
                             tspan.set_attribute("tile.skipped", True)
                             logger.info("Tile skipped no_dets tile=%s", tref.tile_id)
                             status = "no_dets"
-                            return []
+                            await _finalize_tile(
+                                tref, gate_ok, metrics, class_counts, dets, cache_hit, status,
+                                png_path, sem_tile, tile_hash, None, None
+                            )
+                            continue
                         dets_hash = _hash_dets(dets)
                         cached = None
-                        key = ""
                         if cache_enabled:
-                            key = cache.key(tref.image_id, tref.tile_id, rgb, model_id=vlm.model, dets_hash=dets_hash)
+                            model_id = getattr(vlm, "cache_id", vlm.model)
+                            key = cache.key(tref.image_id, tref.tile_id, rgb, model_id=model_id, dets_hash=dets_hash)
                             cached = cache.get(key)
                         if cached is not None:
                             cache_hit = True
                             logger.info("Tile cache hit tile=%s key=%s", tref.tile_id, key)
                             sem_tile = TileSemantics.model_validate(cached["semantics"])
-                        else:
-                            cache_hit = False if cache_enabled else None
-                            logger.info("Tile cache miss tile=%s key=%s", tref.tile_id, key)
-                            sem_tile = await vlm.annotate(tref.tile_id, rgb, dets, class_counts)
-                            if cache_enabled:
-                                cache.put(key, {"tref": asdict(tref), "metrics": metrics, "dets": [d.model_dump() for d in dets],
-                                                "class_counts": class_counts, "semantics": sem_tile.model_dump()})
-                        _normalize_semantics(sem_tile)
-                        geo = aggregator.build_geo_objects(tref, dets, sem_tile) if dets else []
-                        logger.info("Tile geo objects tile=%s count=%s", tref.tile_id, len(geo))
-                        logger.info("Tile done tile=%s elapsed_s=%.3f", tref.tile_id, time.perf_counter() - t0)
-                        status = "ok"
-                        return geo
+                            _normalize_semantics(sem_tile)
+                            geo = aggregator.build_geo_objects(tref, dets, sem_tile) if dets else []
+                            logger.info("Tile geo objects tile=%s count=%s", tref.tile_id, len(geo))
+                            logger.info("Tile done tile=%s elapsed_s=%.3f", tref.tile_id, time.perf_counter() - t0)
+                            status = "ok"
+                            await _finalize_tile(
+                                tref, gate_ok, metrics, class_counts, dets, cache_hit, status,
+                                png_path, sem_tile, tile_hash, vlm_prompt_id, geo
+                            )
+                            continue
+                        cache_hit = False if cache_enabled else None
+                        logger.info("Tile cache miss tile=%s key=%s", tref.tile_id, key)
+                        await vlm_queue.put({
+                            "tref": tref,
+                            "rgb": rgb,
+                            "dets": dets,
+                            "class_counts": class_counts,
+                            "metrics": metrics,
+                            "gate_ok": gate_ok,
+                            "cache_hit": cache_hit,
+                            "png_path": png_path,
+                            "tile_hash": tile_hash,
+                            "key": key,
+                        })
                 except Exception:
                     logger.exception("Tile failed tile=%s", tref.tile_id)
-                    return []
+                    status = "error"
+                    await _finalize_tile(
+                        tref, gate_ok, metrics, class_counts, dets, cache_hit, status,
+                        png_path, sem_tile, tile_hash, None, None
+                    )
                 finally:
-                    entry = {
-                        "image_id": tref.image_id,
-                        "tile_id": tref.tile_id,
-                        "row": tref.row,
-                        "col": tref.col,
-                        "window": list(tref.window),
-                        "bounds": list(tref.bounds),
-                        "transform": list(tref.transform),
-                        "crs_wkt": tref.crs_wkt,
-                        "gate_ok": gate_ok,
-                        "gate_metrics": metrics,
-                        "class_counts": class_counts,
-                        "dets": [d.model_dump() for d in dets] if dets else [],
-                        "cache_hit": cache_hit,
-                        "status": status,
-                        "png_path": _relpath(png_path),
-                        "semantics": sem_tile.model_dump() if sem_tile else None,
-                    }
-                    await _write_manifest(entry)
-                    async with progress_lock:
-                        progress["processed_tiles"] += 1
-                        if gate_ok:
-                            progress["kept_tiles"] += 1
-                        progress["dets_total"] += len(dets)
-                        if cache_enabled and cache_hit is not None:
-                            if cache_hit:
-                                progress["cache_hits"] += 1
-                            else:
-                                progress["cache_misses"] += 1
-                    await _emit_progress("tile", {"tile_id": tref.tile_id, "status": status})
+                    tile_queue.task_done()
 
-        tasks = [asyncio.create_task(handle(t)) for t in tile_refs]
-        results = await asyncio.gather(*tasks)
-        objs = [o for sub in results if sub for o in sub]
+        async def _vlm_worker():
+            while True:
+                item = await vlm_queue.get()
+                if item is None:
+                    vlm_queue.task_done()
+                    break
+                tref = item["tref"]
+                rgb = item["rgb"]
+                dets = item["dets"]
+                class_counts = item["class_counts"]
+                metrics = item["metrics"]
+                gate_ok = item["gate_ok"]
+                cache_hit = item["cache_hit"]
+                png_path = item["png_path"]
+                tile_hash = item["tile_hash"]
+                key = item["key"]
+                sem_tile = None
+                status = "error"
+                geo = []
+                try:
+                    sem_tile = await vlm.annotate(tref.tile_id, rgb, dets, class_counts, image_path=png_path)
+                    _normalize_semantics(sem_tile)
+                    if cache_enabled:
+                        cache.put(key, {"tref": asdict(tref), "metrics": metrics, "dets": [d.model_dump() for d in dets],
+                                        "class_counts": class_counts, "semantics": sem_tile.model_dump()})
+                    geo = aggregator.build_geo_objects(tref, dets, sem_tile) if dets else []
+                    logger.info("Tile geo objects tile=%s count=%s", tref.tile_id, len(geo))
+                    status = "ok"
+                except Exception:
+                    logger.exception("VLM failed tile=%s", tref.tile_id)
+                    status = "error"
+                finally:
+                    await _finalize_tile(
+                        tref, gate_ok, metrics, class_counts, dets, cache_hit, status,
+                        png_path, sem_tile, tile_hash, vlm_prompt_id, geo
+                    )
+                    vlm_queue.task_done()
+
+        async def _producer():
+            for t in tile_refs:
+                await tile_queue.put(t)
+            for _ in range(detector_workers):
+                await tile_queue.put(None)
+
+        detector_tasks = [asyncio.create_task(_detector_worker()) for _ in range(detector_workers)]
+        vlm_tasks = [asyncio.create_task(_vlm_worker()) for _ in range(vlm_workers)]
+        await _producer()
+        await tile_queue.join()
+        await asyncio.gather(*detector_tasks)
+        for _ in range(vlm_workers):
+            await vlm_queue.put(None)
+        await vlm_queue.join()
+        await asyncio.gather(*vlm_tasks)
         objs = aggregator.geo_nms_global(objs)
         progress["objects_total"] = len(objs)
         await _emit_progress("done", {"objects_total": len(objs)})

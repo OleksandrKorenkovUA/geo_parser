@@ -9,6 +9,7 @@ import re
 from typing import Any, Dict, List, Optional, Tuple
 
 import streamlit as st
+import httpx
 from PIL import Image, ImageDraw
 from shapely.geometry import shape, mapping
 from shapely.ops import transform as shp_transform
@@ -207,6 +208,15 @@ def _start_analysis_job(cfg: Dict[str, Any]) -> None:
             _write_json(job_path, job_state)
 
         async def _run():
+            os.environ["VLM_BACKEND"] = cfg.get("vlm_backend", "openai")
+            os.environ["VLM_MODE"] = cfg.get("vlm_mode", "free_text")
+            os.environ["VLM_JSON_SCHEMA"] = cfg.get("vlm_json_schema", "") or ""
+            os.environ["VLM_CHOICE_LIST"] = cfg.get("vlm_choice_list", "") or ""
+            os.environ["VLM_LOG_PAYLOAD"] = "1" if cfg.get("vlm_log_payload") else "0"
+            os.environ["VLM_MAX_IMAGE_SIDE"] = str(cfg.get("vlm_max_image_side", 0) or 0)
+            os.environ["VLM_IMAGE_MODE"] = cfg.get("vlm_image_mode", "base64")
+            os.environ["VLM_IMAGE_URL_PREFIX"] = cfg.get("vlm_image_url_prefix", "") or ""
+            os.environ["VLM_IMAGE_URL_ROOT"] = cfg.get("vlm_image_url_root", "") or ""
             tiler = ImageTiler(tile_size=cfg["tile_size"], overlap=cfg["overlap"], bands=cfg["bands"])
             gate = _build_gate(cfg["gate_mode"], cfg["gate_params"])
             detector = YOLODetector(
@@ -284,6 +294,32 @@ def _collect_index_dirs(base_dir: str) -> List[str]:
                 out.append(idx)
     out.sort()
     return out
+
+
+@st.cache_data(ttl=30)
+def _check_vllm_endpoint(base_url: str) -> Tuple[bool, str]:
+    if not base_url:
+        return False, "VLM base_url is empty"
+    url = base_url.rstrip("/") + "/models"
+    try:
+        r = httpx.get(url, timeout=2.5)
+    except Exception as exc:
+        return False, f"request failed: {type(exc).__name__}: {exc}"
+    if r.status_code != 200:
+        return False, f"unexpected status={r.status_code}"
+    try:
+        payload = r.json()
+    except Exception as exc:
+        return False, f"invalid JSON: {type(exc).__name__}: {exc}"
+    if isinstance(payload, dict):
+        if payload.get("owned_by") == "vllm":
+            return True, "vLLM detected"
+        items = payload.get("data")
+        if isinstance(items, list):
+            for item in items:
+                if isinstance(item, dict) and item.get("owned_by") == "vllm":
+                    return True, "vLLM detected"
+    return False, "response does not look like vLLM"
 
 
 def _collect_runs(base_dir: str) -> List[str]:
@@ -455,34 +491,50 @@ with tab_analyze:
     st.sidebar.header("Параметри аналізу")
     with st.sidebar.expander("Tiling", expanded=True):
         tile_size = st.number_input("tile_size", min_value=128, max_value=4096, value=1024, step=64)
+        st.caption("Розмір тайла в пікселях. Більший тайл = менше тайлів, але більше памʼяті та часу.")
         overlap = st.number_input("overlap", min_value=0, max_value=2048, value=256, step=32)
+        st.caption("Перекриття між тайлами в пікселях. Більше overlap зменшує пропуски на межах.")
         bands_raw = st.text_input("bands (comma-separated)", value="1,2,3")
+        st.caption("Індекси каналів GeoTIFF для складання RGB. Невірні канали дадуть некоректні кольори.")
         st.caption("step = tile_size - overlap")
     with st.sidebar.expander("Gate", expanded=True):
         gate_mode = st.selectbox("GATE_MODE", options=["none", "heuristic", "clip", "cnn"])
+        st.caption("Фільтр тайлів перед детектором. Дає економію, але може зменшити recall.")
         gate_params: Dict[str, Any] = {}
         if gate_mode == "heuristic":
             gate_params["min_score"] = st.number_input("H_SCORE", value=0.24, step=0.01)
+            st.caption("Мінімальний скор якості тайла. Вище = більше відсіву.")
             gate_params["min_edge_density"] = st.number_input("H_EDGE", value=0.05, step=0.01)
+            st.caption("Мінімальна щільність контурів. Вище = строгіше.")
             gate_params["min_entropy"] = st.number_input("H_ENT", value=3.2, step=0.1)
+            st.caption("Мінімальна ентропія текстури. Вище = більше відсікає однорідні області.")
             st.caption("чим вище — тим строгіше")
         elif gate_mode == "clip":
             gate_params["model_name"] = st.text_input("CLIP model_name", value="ViT-B-32")
+            st.caption("Назва моделі OpenCLIP. Впливає на якість і швидкість.")
             gate_params["pretrained"] = st.text_input("CLIP pretrained", value="openai")
+            st.caption("Назва чекпойнта/ваг OpenCLIP.")
             gate_params["device"] = st.text_input("CLIP device", value="cpu")
+            st.caption("Де рахувати CLIP: cpu або cuda.")
             gate_params["threshold"] = st.number_input("CLIP threshold", value=0.15, step=0.01)
+            st.caption("Поріг проходу тайла. Нижче = більше тайлів проходить далі.")
             keep_default = "dense urban area\nbuildings and roads\nparking lot with many cars\nindustrial site"
             drop_default = "forest\nagricultural field\nwater surface\nclouds"
             gate_params["keep_prompts"] = _parse_prompt_lines(
                 st.text_area("CLIP keep prompts (one per line)", value=keep_default), []
             )
+            st.caption("Опис бажаних сцен для пропуску тайла. Більше промптів = вищий recall.")
             gate_params["drop_prompts"] = _parse_prompt_lines(
                 st.text_area("CLIP drop prompts (one per line)", value=drop_default), []
             )
+            st.caption("Опис небажаних сцен для відсіву тайла.")
         elif gate_mode == "cnn":
             gate_params["ckpt_path"] = st.text_input("CNN_GATE_CKPT", value=os.path.join(APP_ROOT, "cnn_gate", "model.pt"))
+            st.caption("Шлях до ваг CNN gate. Має існувати на диску.")
             gate_params["threshold"] = st.number_input("CNN_GATE_THR", value=0.5, step=0.05)
+            st.caption("Поріг ймовірності для проходу. Нижче = більше проходів.")
             gate_params["device"] = st.text_input("CNN_DEVICE", value="cpu")
+            st.caption("Де рахувати CNN: cpu або cuda.")
             if st.button("Validate ckpt"):
                 if os.path.exists(gate_params["ckpt_path"]):
                     st.success("Checkpoint exists.")
@@ -490,37 +542,113 @@ with tab_analyze:
                     st.error("Checkpoint not found.")
     with st.sidebar.expander("Detector (YOLO)", expanded=True):
         yolo_model = st.text_input("model_path", value="yolo12s.pt")
+        st.caption("Шлях до YOLO ваг. Більша модель = вища точність, але повільніше.")
         yolo_conf = st.number_input("conf", min_value=0.0, max_value=1.0, value=0.15, step=0.05)
+        st.caption("Поріг впевненості детектора. Нижче = більше детекцій.")
         yolo_max_det = st.number_input("max_det", min_value=1, max_value=2000, value=400, step=50)
+        st.caption("Ліміт детекцій на тайл. Менше = швидше, але можна втратити обʼєкти.")
         yolo_device = st.text_input("device", value="cpu")
+        st.caption("Де рахувати YOLO: cpu або cuda.")
         nms_iou = st.number_input("NMS IOU", min_value=0.1, max_value=0.95, value=0.6, step=0.05)
+        st.caption("Поріг IoU для NMS. Вище = менш агресивне обʼєднання.")
     with st.sidebar.expander("VLM", expanded=True):
-        vlm_base_url = st.text_input("VLM base_url", value="http://localhost:8000/v1")
-        vlm_api_key = st.text_input("VLM api_key", type="password", value="")
-        vlm_model = st.text_input("VLM model", value="gpt-4o")
+        vlm_base_url = st.text_input("VLM base_url", value="http://gpu-test.silly.billy:8031/v1")
+        st.caption("URL VLM сервісу (OpenAI-compatible).")
+        vlm_api_key = st.text_input("VLM api_key", type="password", value="DUMMY_KEY")
+        st.caption("Ключ доступу до VLM. Не зберігається в репозиторії.")
+        vlm_model = st.selectbox("VLM model", options=["chat-model", "qwen3-vl"], index=0)
+        st.caption("Назва чат-моделі VLM.")
+        vlm_backend = st.selectbox("VLM backend", options=["openai", "vllm_qwen"], index=0)
+        st.caption("Формат multimodal payload: OpenAI style або vLLM Qwen3-VL.")
+        if vlm_backend == "vllm_qwen" and vlm_base_url:
+            ok, msg = _check_vllm_endpoint(vlm_base_url)
+            if ok:
+                st.success(f"VLM endpoint check: {msg}")
+            else:
+                st.warning(f"VLM_BACKEND=vllm_qwen, але endpoint не схожий на vLLM: {msg}")
+        vlm_mode = st.selectbox("VLM_MODE", options=["free_text", "json", "choice"], index=0)
+        st.caption("Structured output режим. Використовуйте тільки один constraint.")
+        vlm_json_schema = ""
+        vlm_choice_list = ""
+        if vlm_mode == "json":
+            vlm_json_schema = st.text_area("VLM_JSON_SCHEMA (JSON)", value="")
+            st.caption("JSON-схема. Якщо пусто — використовується вбудована.")
+        elif vlm_mode == "choice":
+            vlm_choice_list = st.text_input("VLM_CHOICE_LIST", value="vehicle|building|terrain")
+            st.caption("Список дозволених відповідей, розділювач | або ,.")
         vlm_timeout_s = st.number_input("timeout_s", min_value=5.0, max_value=300.0, value=90.0, step=5.0)
+        st.caption("Таймаут одного запиту. Збільшуйте для повільних серверів.")
         vlm_concurrency = st.number_input("concurrency", min_value=1, max_value=32, value=6, step=1)
+        st.caption("Максимум паралельних запитів до VLM. Для vllm_qwen рекомендовано 1-2.")
+        vlm_image_mode = st.selectbox("VLM_IMAGE_MODE", options=["base64", "url", "path"], index=0)
+        st.caption("Як передавати зображення: base64, URL або шлях на диску.")
+        vlm_image_url_prefix = ""
+        vlm_image_url_root = ""
+        if vlm_image_mode == "url":
+            vlm_image_url_prefix = st.text_input("VLM_IMAGE_URL_PREFIX", value="")
+            st.caption("Префікс URL для тайлів (наприклад, https://host/tiles).")
+            vlm_image_url_root = st.text_input("VLM_IMAGE_URL_ROOT", value="")
+            st.caption("Корінь локального шляху для побудови відносного URL (optional).")
+        elif vlm_image_mode == "path":
+            st.caption("Path mode вимагає доступу VLM сервера до локальних файлів.")
+        vlm_max_image_side = st.number_input("VLM_MAX_IMAGE_SIDE", min_value=0, max_value=2048, value=0, step=64)
+        st.caption("0 = без зменшення. Для Qwen3-VL зазвичай 512-768.")
         allow_empty_vlm = st.checkbox("Run VLM on empty tiles", value=False)
+        st.caption("Якщо увімкнено, VLM запускається навіть без детекцій.")
+        vlm_log_payload = st.checkbox("VLM_LOG_PAYLOAD", value=False)
+        st.caption("Логувати фактичний payload (картинка редагується).")
     with st.sidebar.expander("Cache", expanded=True):
         use_cache = st.checkbox("Use cache", value=True)
+        st.caption("Кеш зберігає семантику тайлів і економить VLM-запити.")
         cache_dir = st.text_input("cache_dir", value=os.path.join(APP_ROOT, "out", "cache"))
+        st.caption("Папка для кешу JSON файлів.")
     with st.sidebar.expander("Output", expanded=True):
         max_tiles = st.number_input("max_tiles (0 = all)", min_value=0, max_value=100000, value=0, step=50)
+        st.caption("Ліміт кількості тайлів для тестів. 0 = обробляти всі.")
         max_inflight = st.number_input("max_inflight", min_value=1, max_value=256, value=32, step=4)
+        st.caption("Скільки тайлів одночасно в роботі. Впливає на RAM і швидкість.")
         save_tiles = st.checkbox("Save tile PNG previews", value=True)
+        st.caption("Зберігає PNG превʼю тайлів для перегляду.")
         st.caption("Artifacts stored in runs/<run_id>/")
+    with st.sidebar.expander("UI", expanded=False):
+        auto_refresh = st.checkbox("Auto-refresh status", value=True)
+        refresh_interval = st.number_input("Refresh interval (s)", min_value=2, max_value=60, value=5, step=1)
+        st.caption("Автоматично оновлює статус і логи під час виконання.")
     with st.sidebar.expander("Index", expanded=False):
-        emb_base_url = st.text_input("Embeddings base_url", value="http://localhost:8000/v1", key="emb_base_url_analyze")
+        emb_base_url = st.text_input(
+            "Embeddings base_url",
+            value="http://gpu-test.silly.billy:8022/v1",
+            key="emb_base_url_analyze",
+        )
+        st.caption("URL сервісу ембеддингів (OpenAI-compatible).")
         emb_api_key = st.text_input("Embeddings api_key", type="password", value="", key="emb_api_key_analyze")
-        emb_model = st.text_input("Embeddings model", value="text-embedding-3-large", key="emb_model_analyze")
+        st.caption("Ключ доступу до ембеддингів.")
+        emb_model = st.text_input(
+            "Embeddings model",
+            value="multilingual-embeddings",
+            key="emb_model_analyze",
+        )
+        st.caption("Назва моделі ембеддингів.")
         rail_geojson = st.text_input("rail_geojson (optional)", value="", key="rail_geojson_analyze")
+        st.caption("GeoJSON колій для фільтрів у пошуку (необовʼязково).")
         index_tiles = st.checkbox("INDEX_TILES (tile-level search)", value=True, key="index_tiles_analyze")
+        st.caption("Додає тайли в індекс, щоб шукати по тайлах, а не лише по обʼєктах.")
 
     cols = st.columns(4)
     run_clicked = cols[0].button("Run analysis")
     build_index_clicked = cols[1].button("Build / rebuild index")
     refresh_status = cols[2].button("Refresh status")
     open_last = cols[3].button("Open last results")
+    st.markdown(
+        "\n".join(
+            [
+                "Run analysis — запускає повну обробку вибраного знімка і створює run у runs/.",
+                "Build / rebuild index — будує пошуковий індекс за результатами останнього run.",
+                "Refresh status — оновлює статус поточного run і прогрес.",
+                "Open last results — показує шлях до останнього запуску і відкриває його контекст.",
+            ]
+        )
+    )
 
     if run_clicked and image_path:
         run_id = _safe_run_id(os.path.basename(image_path))
@@ -544,6 +672,15 @@ with tab_analyze:
             "vlm_base_url": vlm_base_url,
             "vlm_api_key": vlm_api_key,
             "vlm_model": vlm_model,
+            "vlm_backend": vlm_backend,
+            "vlm_mode": vlm_mode,
+            "vlm_json_schema": vlm_json_schema,
+            "vlm_choice_list": vlm_choice_list,
+            "vlm_log_payload": bool(vlm_log_payload),
+            "vlm_image_mode": vlm_image_mode,
+            "vlm_image_url_prefix": vlm_image_url_prefix,
+            "vlm_image_url_root": vlm_image_url_root,
+            "vlm_max_image_side": int(vlm_max_image_side),
             "vlm_timeout_s": float(vlm_timeout_s),
             "vlm_concurrency": int(vlm_concurrency),
             "allow_empty_vlm": bool(allow_empty_vlm),
@@ -572,11 +709,18 @@ with tab_analyze:
     if open_last and st.session_state.get("last_run_dir"):
         st.write(f"Last run: {st.session_state['last_run_dir']}")
 
+    if not st.session_state.get("last_run_dir"):
+        runs = _collect_runs(runs_root)
+        if runs:
+            st.session_state["last_run_dir"] = runs[-1]
+
     current_run = st.session_state.get("last_run_dir")
+    status_for_refresh = None
     if current_run:
         job_state = _read_json(_job_state_path(current_run))
         if job_state:
             status = job_state.get("status", "unknown")
+            status_for_refresh = status
             st.write(f"Status: {status}")
             total = job_state.get("total_tiles", 0)
             processed = job_state.get("processed_tiles", 0)
@@ -617,6 +761,16 @@ with tab_analyze:
                         _build_map(features, center)
                     else:
                         st.info("Неможливо показати мапу (CRS або конвертація).")
+        else:
+            status_for_refresh = "pending"
+            st.info("Очікуємо job_state... (auto-refresh увімкнено)")
+
+        if auto_refresh and status_for_refresh in ("running", "pending"):
+            time.sleep(int(refresh_interval))
+            if hasattr(st, "rerun"):
+                st.rerun()
+            else:
+                st.experimental_rerun()
 
         if build_index_clicked and current_run:
             cfg = _read_json(os.path.join(current_run, "run_config.json")) or {}
@@ -650,9 +804,9 @@ with tab_search:
     runs_root = st.text_input("Runs directory (search)", value=os.path.join(APP_ROOT, "runs"))
     index_dirs = _collect_index_dirs(runs_root)
     index_dir = st.selectbox("Index dir", options=index_dirs) if index_dirs else None
-    emb_base_url = st.text_input("Embeddings base_url", value="http://localhost:8000/v1")
+    emb_base_url = st.text_input("Embeddings base_url", value="http://gpu-test.silly.billy:8022/v1")
     emb_api_key = st.text_input("Embeddings api_key", type="password", value="")
-    emb_model = st.text_input("Embeddings model", value="text-embedding-3-large")
+    emb_model = st.text_input("Embeddings model", value="multilingual-embeddings")
     query_text = st.text_area("Запит (українською)", value="знайди склади з синіми дахами біля залізниці")
     top_k = st.slider("top_k", min_value=1, max_value=100, value=15, step=1)
 
@@ -793,7 +947,11 @@ with tab_compare:
             shift_xy = (0.0, 0.0)
             if cfg_a.get("image_path") and cfg_b.get("image_path"):
                 coreg = Coregistrator()
-                shift_xy = coreg.estimate_shift(cfg_a["image_path"], cfg_b["image_path"])
+                try:
+                    shift_xy = coreg.estimate_shift(cfg_a["image_path"], cfg_b["image_path"])
+                except ValueError as exc:
+                    st.error(f"Coregistration failed: {exc}")
+                    st.stop()
             cd = ChangeDetector(iou_match=match_iou, buffer_tol=buffer_tol, vehicle_cluster_radius_m=veh_r)
             report = cd.diff(os.path.basename(a_run), os.path.basename(b_run), crs_wkt, a_objs, b_objs, b_shift_xy=shift_xy)
             report_path = os.path.join(out_dir, "change_report.json")

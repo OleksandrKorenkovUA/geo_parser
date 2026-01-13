@@ -5,6 +5,7 @@ CSV must include columns: image_path,text
 """
 import argparse
 import csv
+import math
 import os
 
 from PIL import Image
@@ -16,10 +17,25 @@ import open_clip
 class CsvPairs(Dataset):
     def __init__(self, csv_path: str, preprocess):
         self.rows = []
+        csv_dir = os.path.dirname(os.path.abspath(csv_path))
+        missing = []
         with open(csv_path, newline="", encoding="utf-8") as f:
             reader = csv.DictReader(f)
             for row in reader:
-                self.rows.append((row["image_path"], row["text"]))
+                path = row.get("image_path")
+                text = row.get("text")
+                if not path or text is None:
+                    raise ValueError("CSV rows must include image_path and text")
+                if not os.path.isabs(path):
+                    alt = os.path.join(csv_dir, path)
+                    if os.path.exists(alt):
+                        path = alt
+                if not os.path.exists(path):
+                    missing.append(path)
+                self.rows.append((path, text))
+        if missing:
+            sample = ", ".join(missing[:5])
+            raise FileNotFoundError(f"missing image files (showing up to 5): {sample}")
         self.preprocess = preprocess
 
     def __len__(self) -> int:
@@ -80,6 +96,7 @@ def main():
 
     model.train()
     step = 0
+    opt.zero_grad(set_to_none=True)
     for ep in range(args.epochs):
         for imgs, txts in dl:
             imgs = imgs.to(device, non_blocking=True)
@@ -100,6 +117,7 @@ def main():
             if (step + 1) % args.accum == 0:
                 scaler.step(opt)
                 scaler.update()
+                model.logit_scale.data.clamp_(0, math.log(100))
                 opt.zero_grad(set_to_none=True)
 
             step += 1

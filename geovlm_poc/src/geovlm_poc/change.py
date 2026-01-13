@@ -83,9 +83,10 @@ def _vehicle_group_sizes(objs: List[GeoObject], radius_m: float, vehicle_labels=
 
 
 class Coregistrator:
-    def __init__(self, max_dim: int = 1024, band: int = 1):
+    def __init__(self, max_dim: int = 1024, band: int = 1, strict_transform: bool = True):
         self.max_dim = max_dim
         self.band = band
+        self.strict_transform = strict_transform
 
     def estimate_shift(self, image_a_path: str, image_b_path: str) -> Tuple[float, float]:
         with tracer.start_as_current_span("coreg.estimate") as span:
@@ -94,20 +95,31 @@ class Coregistrator:
             logger.info("Coregistration estimate start a=%s b=%s", image_a_path, image_b_path)
             with rasterio.open(image_a_path) as da, rasterio.open(image_b_path) as db:
                 if da.crs and db.crs and da.crs != db.crs:
-                    logger.warning("Coregistration CRS mismatch a=%s b=%s; returning zero shift", da.crs, db.crs)
+                    msg = f"Coregistration CRS mismatch a={da.crs} b={db.crs}"
+                    if self.strict_transform:
+                        raise ValueError(msg)
+                    logger.warning("%s; returning zero shift", msg)
                     return (0.0, 0.0)
                 if da.transform != db.transform:
-                    logger.warning("Coregistration transforms differ a=%s b=%s", da.transform, db.transform)
+                    msg = f"Coregistration transforms differ a={da.transform} b={db.transform}"
+                    if self.strict_transform:
+                        raise ValueError(msg)
+                    logger.warning(msg)
                 out_w, out_h = self._common_out_shape(da.width, da.height, db.width, db.height)
                 img_a = self._read_gray(da, out_h, out_w)
                 img_b = self._read_gray(db, out_h, out_w)
                 shift_px, response = cv2.phaseCorrelate(img_a, img_b)
                 dx_px, dy_px = float(shift_px[0]), float(shift_px[1])
-                scale_x = da.width / float(out_w)
-                scale_y = da.height / float(out_h)
+                if da.transform != db.transform:
+                    logger.warning("Coregistration using image B transform for shift conversion")
+                    ref = db
+                else:
+                    ref = da
+                scale_x = ref.width / float(out_w)
+                scale_y = ref.height / float(out_h)
                 dx_full = dx_px * scale_x
                 dy_full = dy_px * scale_y
-                a, b, c, d, e, f = da.transform
+                a, b, c, d, e, f = ref.transform
                 dx_geo = a * dx_full + b * dy_full
                 dy_geo = d * dx_full + e * dy_full
                 span.set_attribute("shift.px.dx", dx_px)

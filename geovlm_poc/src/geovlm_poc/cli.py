@@ -23,6 +23,13 @@ def _require_env(key: str) -> str:
     return val
 
 
+def _env_flag(key: str, default: bool = False) -> bool:
+    val = os.environ.get(key)
+    if val is None:
+        return default
+    return val.strip().lower() in ("1", "true", "yes", "y", "on")
+
+
 def _require_file(path: str, label: str) -> str:
     if not os.path.exists(path):
         raise FileNotFoundError(f"{label} not found: {path}")
@@ -110,10 +117,12 @@ async def cmd_analyze(a_path: str, b_path: str, out_dir: str):
             out_a = os.path.join(out_dir, "a.objects.jsonl")
             out_b = os.path.join(out_dir, "b.objects.jsonl")
             a_id, crs_wkt, a_objs = await process_image(
-                a_path, out_a, tiler, gate, detector, vlm, cache, aggregator, max_inflight=max_inflight
+                a_path, out_a, tiler, gate, detector, vlm, cache, aggregator, max_inflight=max_inflight,
+                allow_empty_vlm=_env_flag("ALLOW_EMPTY_VLM", default=False)
             )
             b_id, _, b_objs = await process_image(
-                b_path, out_b, tiler, gate, detector, vlm, cache, aggregator, max_inflight=max_inflight
+                b_path, out_b, tiler, gate, detector, vlm, cache, aggregator, max_inflight=max_inflight,
+                allow_empty_vlm=_env_flag("ALLOW_EMPTY_VLM", default=False)
             )
             if not crs_wkt:
                 raise RuntimeError("GeoTIFF CRS is missing; distance buffers require projected CRS in meters.")
@@ -162,7 +171,7 @@ async def cmd_analyze_single(image_path: str, out_dir: str):
         try:
             out_path = os.path.join(out_dir, "objects.jsonl")
             await process_image(image_path, out_path, tiler, gate, detector, vlm, cache, aggregator,
-                                max_inflight=max_inflight)
+                                max_inflight=max_inflight, allow_empty_vlm=_env_flag("ALLOW_EMPTY_VLM", default=False))
             logger.info("Analyze single output objects=%s", out_path)
             print(out_path)
         finally:

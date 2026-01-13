@@ -1,6 +1,8 @@
 from typing import Any, Dict, List, Tuple
+from numbers import Integral
 import logging
 from shapely.geometry import Polygon, shape
+from shapely.strtree import STRtree
 from .types import DetBox, GeoObject, TileRef, TileSemantics
 from .telemetry import get_tracer
 from .normalize import normalize_label, normalize_roof_color
@@ -76,8 +78,10 @@ class GeoAggregator:
         with tracer.start_as_current_span("geo.nms") as span:
             if not objs:
                 return objs
-            polys = []
-            for o in objs:
+            geoms = []
+            local_to_orig = []
+            orig_to_local = {}
+            for idx, o in enumerate(objs):
                 try:
                     g = shape(o.geometry)
                     if not g.is_valid:
@@ -86,27 +90,48 @@ class GeoAggregator:
                         g = None
                 except Exception:
                     g = None
-                polys.append(g)
+                if g is not None:
+                    orig_to_local[idx] = len(geoms)
+                    local_to_orig.append(idx)
+                    geoms.append(g)
+            if not geoms:
+                logger.warning("Geo NMS: no valid polygons")
+                return objs
+            tree = STRtree(geoms)
+            geom_id_to_local = {id(g): i for i, g in enumerate(geoms)}
             order = sorted(range(len(objs)), key=lambda i: objs[i].confidence, reverse=True)
+            rank = {idx: pos for pos, idx in enumerate(order)}
             keep = []
             suppressed = set()
             for pi, i in enumerate(order):
                 if i in suppressed:
                     continue
                 keep.append(i)
-                for pj in range(pi + 1, len(order)):
-                    j = order[pj]
-                    if j in suppressed:
+                li = orig_to_local.get(i)
+                if li is None:
+                    continue
+                gi = geoms[li]
+                if gi.geom_type not in ("Polygon", "MultiPolygon"):
+                    continue
+                candidates = tree.query(gi)
+                for cand in candidates:
+                    if isinstance(cand, Integral):
+                        lj = int(cand)
+                    else:
+                        lj = geom_id_to_local.get(id(cand))
+                        if lj is None:
+                            continue
+                    j = local_to_orig[lj]
+                    if j == i or j in suppressed:
                         continue
-                    if polys[i] is None or polys[j] is None:
+                    if rank[j] <= rank[i]:
                         continue
-                    if polys[i].geom_type not in ("Polygon", "MultiPolygon"):
-                        continue
-                    if polys[j].geom_type not in ("Polygon", "MultiPolygon"):
+                    gj = geoms[lj]
+                    if gj.geom_type not in ("Polygon", "MultiPolygon"):
                         continue
                     if objs[i].label != objs[j].label:
                         continue
-                    if iou_poly(polys[i], polys[j]) >= self.nms_iou:
+                    if iou_poly(gi, gj) >= self.nms_iou:
                         suppressed.add(j)
             span.set_attribute("nms.kept", len(keep))
             return [objs[i] for i in keep]
