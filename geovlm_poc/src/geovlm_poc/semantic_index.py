@@ -154,6 +154,7 @@ def build_change_text(ev: ChangeEvent) -> str:
 def build_tile_text(tile: Dict[str, Any]) -> str:
     sem = tile.get("semantics") or {}
     scene = (sem.get("scene") or "").strip()
+    tile_summary = sem.get("tile_summary") or {}
     class_counts = tile.get("class_counts") or {}
     anns = sem.get("annotations") or []
     labels = [normalize_label(a.get("label")) for a in anns if a.get("label")]
@@ -169,6 +170,8 @@ def build_tile_text(tile: Dict[str, Any]) -> str:
     tech_parts = []
     if scene:
         tech_parts.append(f"scene: {scene}")
+    if tile_summary:
+        tech_parts.append("tile_summary: " + json.dumps(tile_summary, ensure_ascii=False, sort_keys=True))
     if class_counts:
         tech_parts.append("class_counts: " + json.dumps(class_counts, ensure_ascii=False, sort_keys=True))
     if labels:

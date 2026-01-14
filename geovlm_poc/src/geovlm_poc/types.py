@@ -29,10 +29,29 @@ class VLMBoxAnnotation(BaseModel):
     notes: Optional[str] = None
 
 
+class VLMTileSummary(BaseModel):
+    scene_type: Optional[str] = None
+    terrain: Dict[str, Any] = Field(default_factory=dict)
+    activity_traces: Dict[str, Any] = Field(default_factory=dict)
+    overall_observations: Optional[str] = None
+
+
+class VLMDetection(BaseModel):
+    det_id: int
+    bbox: Optional[Tuple[int, int, int, int]] = None
+    label: Optional[str] = None
+    confidence_visual: Optional[str] = None
+    object_description: Dict[str, Any] = Field(default_factory=dict)
+    local_context: Dict[str, Any] = Field(default_factory=dict)
+    analyst_notes: Dict[str, Any] = Field(default_factory=dict)
+
+
 class TileSemantics(BaseModel):
-    tile_id: str
-    scene: str
+    tile_id: Optional[str] = None
+    scene: Optional[str] = None
     annotations: List[VLMBoxAnnotation] = Field(default_factory=list)
+    tile_summary: Optional[VLMTileSummary] = None
+    detections: List[VLMDetection] = Field(default_factory=list)
 
 
 class GeoObject(BaseModel):

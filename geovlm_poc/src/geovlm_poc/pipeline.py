@@ -3,7 +3,7 @@ from dataclasses import asdict
 from typing import Any, Callable, Dict, List, Optional, Tuple
 import numpy as np
 from PIL import Image
-from .types import DetBox, GeoObject, TileRef, TileSemantics
+from .types import DetBox, GeoObject, TileRef, TileSemantics, VLMBoxAnnotation
 from .tiling import ImageTiler
 from .gates import TileGate
 from .detector import Detector
@@ -147,7 +147,38 @@ def _hash_rgb(rgb: np.ndarray) -> str:
     return h.hexdigest()
 
 
+def _attrs_from_detection(det) -> Dict[str, Any]:
+    attrs: Dict[str, Any] = {}
+    obj_desc = getattr(det, "object_description", None) or {}
+    local_ctx = getattr(det, "local_context", None) or {}
+    notes = getattr(det, "analyst_notes", None) or {}
+    roof = obj_desc.get("roof") or {}
+    if "color" in roof:
+        attrs["roof_color"] = roof.get("color")
+    for key in ("surface_type", "material", "construction_state", "vehicle_type"):
+        if key in obj_desc:
+            attrs[key] = obj_desc.get(key)
+    if obj_desc:
+        attrs["object_description"] = obj_desc
+    if local_ctx:
+        attrs["local_context"] = local_ctx
+    if notes:
+        attrs["analyst_notes"] = notes
+    if getattr(det, "confidence_visual", None):
+        attrs["confidence_visual"] = det.confidence_visual
+    return attrs
+
+
 def _normalize_semantics(sem: TileSemantics) -> None:
+    if not sem.scene and sem.tile_summary and sem.tile_summary.scene_type:
+        sem.scene = sem.tile_summary.scene_type
+    if not sem.annotations and sem.detections:
+        anns = []
+        for det in sem.detections:
+            label = (det.label or "").strip() or "object"
+            attrs = _attrs_from_detection(det)
+            anns.append(VLMBoxAnnotation(det_id=int(det.det_id), label=label, attributes=attrs))
+        sem.annotations = anns
     for ann in sem.annotations:
         ann.label = normalize_label(ann.label)
         attrs = ann.attributes
@@ -166,6 +197,25 @@ def _save_tile_png(rgb: np.ndarray, path: str) -> None:
     im.save(path, format="PNG", optimize=True)
 
 
+def _write_json(path: str, obj: Any) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+
+def _write_tile_bundle(bundle_dir: Optional[str], entry: Dict[str, Any], dets: List[DetBox],
+                       sem_tile: Optional[TileSemantics], geo: Optional[List[GeoObject]]) -> None:
+    if not bundle_dir:
+        return
+    os.makedirs(bundle_dir, exist_ok=True)
+    _write_json(os.path.join(bundle_dir, "tile.json"), entry)
+    _write_json(os.path.join(bundle_dir, "dets.json"), [d.model_dump() for d in dets] if dets else [])
+    _write_json(os.path.join(bundle_dir, "semantics.json"), sem_tile.model_dump() if sem_tile else None)
+    _write_json(os.path.join(bundle_dir, "geoobjects.json"), [g.model_dump() for g in (geo or [])])
+
+
 async def process_image(path: str, out_jsonl: str,
                         tiler: ImageTiler, gate: TileGate,
                         detector: Detector, vlm: VLMAnnotator,
@@ -176,7 +226,8 @@ async def process_image(path: str, out_jsonl: str,
                         tiles_dir: Optional[str] = None,
                         tile_manifest_path: Optional[str] = None,
                         progress_cb: Optional[Callable[[Dict[str, Any]], None]] = None,
-                        allow_empty_vlm: bool = False) -> Tuple[str, str, List[GeoObject]]:
+                        allow_empty_vlm: bool = True,
+                        tile_bundle_dir: Optional[str] = None) -> Tuple[str, str, List[GeoObject]]:
     with tracer.start_as_current_span("process_image") as span:
         span.set_attribute("image.path", path)
         span.set_attribute("output.jsonl", out_jsonl)
@@ -208,6 +259,8 @@ async def process_image(path: str, out_jsonl: str,
             os.makedirs(os.path.dirname(tile_manifest_path) or ".", exist_ok=True)
             with open(tile_manifest_path, "w", encoding="utf-8"):
                 pass
+        if tile_bundle_dir:
+            os.makedirs(tile_bundle_dir, exist_ok=True)
         manifest_lock = asyncio.Lock()
         progress_lock = asyncio.Lock()
         progress = {
@@ -241,6 +294,11 @@ async def process_image(path: str, out_jsonl: str,
             except ValueError:
                 return p
 
+        def _bundle_base(tref: TileRef) -> Optional[str]:
+            if not tile_bundle_dir:
+                return None
+            return os.path.join(tile_bundle_dir, tref.image_id, tref.tile_id)
+
         async def _write_manifest(entry: Dict[str, Any]) -> None:
             if not tile_manifest_path:
                 return
@@ -266,6 +324,8 @@ async def process_image(path: str, out_jsonl: str,
             cache_hit: Optional[bool],
             status: str,
             png_path: Optional[str],
+            bundle_dir: Optional[str],
+            bundle_png_path: Optional[str],
             sem_tile: Optional[TileSemantics],
             tile_hash: Optional[str],
             prompt_id: Optional[str],
@@ -274,6 +334,8 @@ async def process_image(path: str, out_jsonl: str,
             if geo:
                 async with objs_lock:
                     objs.extend(geo)
+            bundle_dir_rel = _relpath(bundle_dir) if bundle_dir else None
+            bundle_png_rel = _relpath(bundle_png_path) if bundle_png_path else None
             entry = {
                 "image_id": tref.image_id,
                 "tile_id": tref.tile_id,
@@ -290,6 +352,8 @@ async def process_image(path: str, out_jsonl: str,
                 "cache_hit": cache_hit,
                 "status": status,
                 "png_path": _relpath(png_path),
+                "bundle_dir": bundle_dir_rel,
+                "bundle_png_path": bundle_png_rel,
                 "semantics": sem_tile.model_dump() if sem_tile else None,
                 "tile_hash": tile_hash,
                 "prompt_id": prompt_id,
@@ -298,6 +362,7 @@ async def process_image(path: str, out_jsonl: str,
                 "vlm_prompt_id": vlm_prompt_id,
                 "gate_name": gate_name,
             }
+            _write_tile_bundle(bundle_dir, entry, dets, sem_tile, geo)
             await _write_manifest(entry)
             async with progress_lock:
                 progress["processed_tiles"] += 1
@@ -324,6 +389,8 @@ async def process_image(path: str, out_jsonl: str,
                 cache_hit = None
                 sem_tile: Optional[TileSemantics] = None
                 png_path = None
+                bundle_dir = None
+                bundle_png_path = None
                 status = "error"
                 tile_hash = None
                 key = ""
@@ -347,13 +414,17 @@ async def process_image(path: str, out_jsonl: str,
                             status = "skipped_gate"
                             await _finalize_tile(
                                 tref, gate_ok, metrics, class_counts, dets, cache_hit, status,
-                                png_path, sem_tile, tile_hash, None, None
+                                png_path, bundle_dir, bundle_png_path, sem_tile, tile_hash, None, None
                             )
                             continue
                         gate_ok = True
                         if tile_img_dir:
                             png_path = os.path.join(tile_img_dir, f"{tref.tile_id}.png")
                             _save_tile_png(rgb, png_path)
+                        bundle_dir = _bundle_base(tref)
+                        if bundle_dir:
+                            bundle_png_path = os.path.join(bundle_dir, "tile.png")
+                            _save_tile_png(rgb, bundle_png_path)
                         if offload_cpu:
                             dets, class_counts = await asyncio.to_thread(detector.detect, rgb)
                         else:
@@ -365,7 +436,7 @@ async def process_image(path: str, out_jsonl: str,
                             status = "no_dets"
                             await _finalize_tile(
                                 tref, gate_ok, metrics, class_counts, dets, cache_hit, status,
-                                png_path, sem_tile, tile_hash, None, None
+                                png_path, bundle_dir, bundle_png_path, sem_tile, tile_hash, None, None
                             )
                             continue
                         dets_hash = _hash_dets(dets)
@@ -385,7 +456,7 @@ async def process_image(path: str, out_jsonl: str,
                             status = "ok"
                             await _finalize_tile(
                                 tref, gate_ok, metrics, class_counts, dets, cache_hit, status,
-                                png_path, sem_tile, tile_hash, vlm_prompt_id, geo
+                                png_path, bundle_dir, bundle_png_path, sem_tile, tile_hash, vlm_prompt_id, geo
                             )
                             continue
                         cache_hit = False if cache_enabled else None
@@ -399,6 +470,8 @@ async def process_image(path: str, out_jsonl: str,
                             "gate_ok": gate_ok,
                             "cache_hit": cache_hit,
                             "png_path": png_path,
+                            "bundle_dir": bundle_dir,
+                            "bundle_png_path": bundle_png_path,
                             "tile_hash": tile_hash,
                             "key": key,
                         })
@@ -407,7 +480,7 @@ async def process_image(path: str, out_jsonl: str,
                     status = "error"
                     await _finalize_tile(
                         tref, gate_ok, metrics, class_counts, dets, cache_hit, status,
-                        png_path, sem_tile, tile_hash, None, None
+                        png_path, bundle_dir, bundle_png_path, sem_tile, tile_hash, None, None
                     )
                 finally:
                     tile_queue.task_done()
@@ -426,6 +499,8 @@ async def process_image(path: str, out_jsonl: str,
                 gate_ok = item["gate_ok"]
                 cache_hit = item["cache_hit"]
                 png_path = item["png_path"]
+                bundle_dir = item["bundle_dir"]
+                bundle_png_path = item["bundle_png_path"]
                 tile_hash = item["tile_hash"]
                 key = item["key"]
                 sem_tile = None
@@ -446,7 +521,7 @@ async def process_image(path: str, out_jsonl: str,
                 finally:
                     await _finalize_tile(
                         tref, gate_ok, metrics, class_counts, dets, cache_hit, status,
-                        png_path, sem_tile, tile_hash, vlm_prompt_id, geo
+                        png_path, bundle_dir, bundle_png_path, sem_tile, tile_hash, vlm_prompt_id, geo
                     )
                     vlm_queue.task_done()
 

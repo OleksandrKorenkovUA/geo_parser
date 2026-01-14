@@ -102,6 +102,10 @@ async def cmd_analyze(a_path: str, b_path: str, out_dir: str):
         aggregator = GeoAggregator(nms_iou=float(os.environ.get("NMS_IOU", "0.6")))
         cache = TileCache(os.path.join(out_dir, "cache"))
         max_inflight = int(os.environ.get("MAX_INFLIGHT_TILES", "32"))
+        tile_bundle_dir = os.environ.get("TILE_BUNDLE_DIR", "").strip() or None
+        save_tile_bundles = _env_flag("SAVE_TILE_BUNDLES", default=bool(tile_bundle_dir))
+        if save_tile_bundles and not tile_bundle_dir:
+            tile_bundle_dir = os.path.join(out_dir, "tile_bundles")
 
         base_url = _require_env("VLM_BASE_URL")
         api_key = _require_env("VLM_API_KEY")
@@ -118,11 +122,13 @@ async def cmd_analyze(a_path: str, b_path: str, out_dir: str):
             out_b = os.path.join(out_dir, "b.objects.jsonl")
             a_id, crs_wkt, a_objs = await process_image(
                 a_path, out_a, tiler, gate, detector, vlm, cache, aggregator, max_inflight=max_inflight,
-                allow_empty_vlm=_env_flag("ALLOW_EMPTY_VLM", default=False)
+                allow_empty_vlm=_env_flag("ALLOW_EMPTY_VLM", default=True),
+                tile_bundle_dir=tile_bundle_dir,
             )
             b_id, _, b_objs = await process_image(
                 b_path, out_b, tiler, gate, detector, vlm, cache, aggregator, max_inflight=max_inflight,
-                allow_empty_vlm=_env_flag("ALLOW_EMPTY_VLM", default=False)
+                allow_empty_vlm=_env_flag("ALLOW_EMPTY_VLM", default=True),
+                tile_bundle_dir=tile_bundle_dir,
             )
             if not crs_wkt:
                 raise RuntimeError("GeoTIFF CRS is missing; distance buffers require projected CRS in meters.")
@@ -161,6 +167,10 @@ async def cmd_analyze_single(image_path: str, out_dir: str):
         aggregator = GeoAggregator(nms_iou=float(os.environ.get("NMS_IOU", "0.6")))
         cache = TileCache(os.path.join(out_dir, "cache"))
         max_inflight = int(os.environ.get("MAX_INFLIGHT_TILES", "32"))
+        tile_bundle_dir = os.environ.get("TILE_BUNDLE_DIR", "").strip() or None
+        save_tile_bundles = _env_flag("SAVE_TILE_BUNDLES", default=bool(tile_bundle_dir))
+        if save_tile_bundles and not tile_bundle_dir:
+            tile_bundle_dir = os.path.join(out_dir, "tile_bundles")
 
         base_url = _require_env("VLM_BASE_URL")
         api_key = _require_env("VLM_API_KEY")
@@ -171,7 +181,9 @@ async def cmd_analyze_single(image_path: str, out_dir: str):
         try:
             out_path = os.path.join(out_dir, "objects.jsonl")
             await process_image(image_path, out_path, tiler, gate, detector, vlm, cache, aggregator,
-                                max_inflight=max_inflight, allow_empty_vlm=_env_flag("ALLOW_EMPTY_VLM", default=False))
+                                max_inflight=max_inflight,
+                                allow_empty_vlm=_env_flag("ALLOW_EMPTY_VLM", default=True),
+                                tile_bundle_dir=tile_bundle_dir)
             logger.info("Analyze single output objects=%s", out_path)
             print(out_path)
         finally:

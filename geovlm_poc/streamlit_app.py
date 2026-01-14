@@ -1,5 +1,6 @@
 import os
 import sys
+import subprocess
 import json
 import time
 import threading
@@ -251,6 +252,7 @@ def _start_analysis_job(cfg: Dict[str, Any]) -> None:
                     tile_manifest_path=cfg["tile_manifest"],
                     progress_cb=_progress_cb,
                     allow_empty_vlm=cfg["allow_empty_vlm"],
+                    tile_bundle_dir=cfg.get("tile_bundle_dir"),
                 )
                 job_state.update({
                     "status": "done",
@@ -353,6 +355,14 @@ def _load_tile_manifest_map(path: str) -> Dict[str, Dict[str, Any]]:
             if png_path and not os.path.isabs(png_path):
                 png_path = os.path.join(base, png_path)
             item["png_path"] = png_path
+            bundle_dir = item.get("bundle_dir")
+            if bundle_dir and not os.path.isabs(bundle_dir):
+                bundle_dir = os.path.join(base, bundle_dir)
+            item["bundle_dir"] = bundle_dir
+            bundle_png_path = item.get("bundle_png_path")
+            if bundle_png_path and not os.path.isabs(bundle_png_path):
+                bundle_png_path = os.path.join(base, bundle_png_path)
+            item["bundle_png_path"] = bundle_png_path
             out[tile_id] = item
     return out
 
@@ -465,6 +475,23 @@ def _parse_det_id_from_doc_id(doc_id: str) -> Optional[int]:
         return int(m.group(1))
     except ValueError:
         return None
+
+
+def _open_path(path: str) -> Tuple[bool, str]:
+    if not path:
+        return False, "path is empty"
+    if not os.path.exists(path):
+        return False, "path does not exist"
+    try:
+        if sys.platform.startswith("darwin"):
+            subprocess.run(["open", path], check=False)
+        elif os.name == "nt":
+            os.startfile(path)  # type: ignore[attr-defined]
+        else:
+            subprocess.run(["xdg-open", path], check=False)
+        return True, ""
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {exc}"
 
 
 st.set_page_config(page_title="GeoVLM UI", layout="wide")
@@ -593,8 +620,8 @@ with tab_analyze:
             st.caption("Path mode вимагає доступу VLM сервера до локальних файлів.")
         vlm_max_image_side = st.number_input("VLM_MAX_IMAGE_SIDE", min_value=0, max_value=2048, value=0, step=64)
         st.caption("0 = без зменшення. Для Qwen3-VL зазвичай 512-768.")
-        allow_empty_vlm = st.checkbox("Run VLM on empty tiles", value=False)
-        st.caption("Якщо увімкнено, VLM запускається навіть без детекцій.")
+        allow_empty_vlm = st.checkbox("Run VLM on empty tiles", value=True)
+        st.caption("VLM запускається навіть якщо YOLO нічого не знайшло.")
         vlm_log_payload = st.checkbox("VLM_LOG_PAYLOAD", value=False)
         st.caption("Логувати фактичний payload (картинка редагується).")
     with st.sidebar.expander("Cache", expanded=True):
@@ -609,6 +636,8 @@ with tab_analyze:
         st.caption("Скільки тайлів одночасно в роботі. Впливає на RAM і швидкість.")
         save_tiles = st.checkbox("Save tile PNG previews", value=True)
         st.caption("Зберігає PNG превʼю тайлів для перегляду.")
+        save_tile_bundles = st.checkbox("Save per-tile bundles (image + JSON)", value=True)
+        st.caption("Створює папку на кожен тайл з PNG і всіма JSON описами.")
         st.caption("Artifacts stored in runs/<run_id>/")
     with st.sidebar.expander("UI", expanded=False):
         auto_refresh = st.checkbox("Auto-refresh status", value=True)
@@ -654,6 +683,7 @@ with tab_analyze:
         run_id = _safe_run_id(os.path.basename(image_path))
         run_dir = os.path.join(runs_root, run_id)
         tiles_dir = os.path.join(run_dir, "tiles")
+        tile_bundle_dir = os.path.join(run_dir, "tile_bundles") if save_tile_bundles else None
         tile_manifest = os.path.join(run_dir, "tile_manifest.jsonl")
         out_jsonl = os.path.join(run_dir, "geoobjects.jsonl")
         cfg = {
@@ -689,7 +719,9 @@ with tab_analyze:
             "max_tiles": int(max_tiles) if int(max_tiles) > 0 else None,
             "max_inflight": int(max_inflight),
             "save_tiles": bool(save_tiles),
+            "save_tile_bundles": bool(save_tile_bundles),
             "tiles_dir": tiles_dir,
+            "tile_bundle_dir": tile_bundle_dir,
             "tile_manifest": tile_manifest,
             "out_jsonl": out_jsonl,
         }
@@ -876,6 +908,16 @@ with tab_search:
                     st.image(img, caption=f"Tile {tile_id}")
                 else:
                     st.image(tile_entry["png_path"], caption=f"Tile {tile_id}")
+            if tile_entry:
+                bundle_dir = tile_entry.get("bundle_dir")
+                if bundle_dir:
+                    st.caption(f"Bundle: {bundle_dir}")
+                    if st.button("Open tile bundle folder", key=f"open_bundle_{tile_id}"):
+                        ok, msg = _open_path(bundle_dir)
+                        if ok:
+                            st.success("Opened bundle folder.")
+                        else:
+                            st.error(f"Open failed: {msg}")
         with cols[1]:
             features = []
             centers = []

@@ -31,7 +31,10 @@ class VLMAnnotator:
         self.base_url = base_url.rstrip("/")
         self.api_key = (api_key or "").strip()
         self.model = model
-        self.prompt_id = os.environ.get("VLM_PROMPT_ID", "vlm_prompt_v1")
+        prompt_cfg = self._load_prompt_config()
+        self.system_prompt = prompt_cfg["system_prompt"]
+        self.user_prompt_template = prompt_cfg["user_prompt_template"]
+        self.prompt_id = os.environ.get("VLM_PROMPT_ID", "vlm_prompt_v2")
         self.backend = os.environ.get("VLM_BACKEND", "openai").strip().lower()
         self.mode = os.environ.get("VLM_MODE", "free_text").strip().lower()
         self.choice_list = _parse_list(os.environ.get("VLM_CHOICE_LIST", ""))
@@ -118,6 +121,8 @@ class VLMAnnotator:
                     content = r.json()["choices"][0]["message"]["content"]
                     data = self._load_json_strict(content)
                     sem = TileSemantics.model_validate(data)
+                    if not sem.tile_id:
+                        sem.tile_id = tile_id
                     logger.info("VLM annotate done tile=%s annotations=%s elapsed_s=%.3f",
                                 tile_id, len(sem.annotations), time.perf_counter() - t0)
                     return sem
@@ -159,7 +164,7 @@ class VLMAnnotator:
 
     def _build_payload(self, prompt: str, png_b64: str, image_path: Optional[str] = None) -> Dict[str, Any]:
         messages = [
-            {"role": "system", "content": "Return ONLY valid JSON. Do not change bbox. Do not invent new det_id. Use det_id mapping."},
+            {"role": "system", "content": self.system_prompt},
             {"role": "user", "content": prompt},
         ]
         payload = {"model": self.model, "messages": messages, "temperature": 0}
@@ -214,6 +219,8 @@ class VLMAnnotator:
 
     def _build_cache_id(self) -> str:
         parts = [self.model, self.backend, self.mode, f"max{self.max_image_side}", f"img:{self.image_mode}"]
+        if self.prompt_id:
+            parts.append(f"prompt:{self.prompt_id}")
         if self.mode == "json" and self.json_schema:
             blob = json.dumps(self.json_schema, sort_keys=True)
             parts.append(f"json={self._short_hash(blob)}")
@@ -312,24 +319,149 @@ class VLMAnnotator:
             bbox = list(d.bbox_px)
             if scaled:
                 bbox = self._scale_bbox(d.bbox_px, scale_x, scale_y)
-            det_list.append({"det_id": d.det_id, "bbox_px": bbox, "det_score": d.score, "det_cls": d.cls})
+            det_list.append({"det_id": d.det_id, "bbox": bbox, "det_score": d.score, "det_cls": d.cls})
         schema = {
             "tile_id": tile_id,
-            "scene": "string",
-            "annotations": [{"det_id": 0, "label": "string", "attributes": {}, "notes": "string|null"}],
+            "tile_summary": {
+                "scene_type": "string",
+                "terrain": {
+                    "relief": "flat|rolling|hilly|uneven|mixed|uncertain",
+                    "elevation_changes_visible": True,
+                    "natural_features": {
+                        "forest": {
+                            "present": True,
+                            "density": "sparse|medium|dense|mixed|uncertain",
+                            "clearings": True,
+                            "logging_traces": True,
+                        },
+                        "water": {
+                            "present": False,
+                            "type": "river|lake|pond|ditch|uncertain",
+                        },
+                        "open_fields": {
+                            "present": True,
+                            "surface": "soil|grass|mixed|uncertain",
+                            "disturbance_visible": True,
+                        },
+                    },
+                },
+                "activity_traces": {
+                    "vehicle_tracks": {
+                        "present": True,
+                        "pattern": "linear|curved|repeated|chaotic|uncertain",
+                    },
+                    "excavation_or_earthworks": {
+                        "present": False,
+                        "type": "trench|pit|mound|crater|uncertain",
+                    },
+                    "construction_activity": {
+                        "present": True,
+                        "stage": "early|ongoing|abandoned|uncertain",
+                    },
+                },
+                "overall_observations": "string",
+            },
+            "detections": [
+                {
+                    "det_id": 0,
+                    "bbox": [0, 0, 0, 0],
+                    "label": "string",
+                    "confidence_visual": "high|medium|low|uncertain",
+                    "object_description": {
+                        "shape": "rectangular|circular|elongated|irregular|complex|uncertain",
+                        "size_relative": "small|medium|large|uncertain",
+                        "orientation": "north-south|east-west|diagonal|irregular|uncertain",
+                        "levels": "single-story|multi-story|uncertain",
+                        "material": "concrete|metal|wood|mixed|uncertain",
+                        "roof": {
+                            "type": "flat|gabled|pitched|irregular|uncertain",
+                            "color": "string|uncertain",
+                            "condition": "intact|damaged|partially damaged|patched|uncertain",
+                            "visible_details": "string",
+                        },
+                        "surface_type": "paved|dirt|grass|mixed|uncertain",
+                        "construction_state": "completed|under_construction|abandoned|ruined|uncertain",
+                        "vehicle_type": "civilian|truck|heavy_vehicle|tracked|wheeled|uncertain|none",
+                    },
+                    "local_context": {
+                        "adjacent_objects": ["road", "path", "fence", "vegetation", "other_structures"],
+                        "ground_conditions": {
+                            "disturbed": True,
+                            "tracks_visible": True,
+                            "soil_color_variation": True,
+                        },
+                        "accessibility": {
+                            "direct_road_access": True,
+                            "footpaths_visible": True,
+                        },
+                    },
+                    "analyst_notes": {
+                        "uncertainties": "string",
+                        "why_label_was_chosen": "string",
+                        "potential_alternative_interpretations": "string",
+                    },
+                }
+            ],
         }
         size_note = f"Image size (px): {image_size[0]}x{image_size[1]}"
         if scaled:
             size_note += " (bboxes are scaled to this image)"
-        return (
-            "You analyze a satellite tile. You are given YOLO detections.\n"
-            "Use YOLO class summary as strong context and keep your labels consistent.\n"
-            f"{size_note}\n"
-            f"YOLO tile class counts:\n{json.dumps(class_counts)}\n"
-            f"Detections (det_id mapping, do not change bbox):\n{json.dumps(det_list)}\n"
-            f"Return ONLY JSON matching schema:\n{json.dumps(schema)}\n"
-            "For each detection, fill label and attributes when visible: roof_color, surface_type, material, construction_state, vehicle_type.\n"
-        )
+        data = {
+            "tile_id": tile_id,
+            "size_note": size_note,
+            "class_counts": json.dumps(class_counts),
+            "detections": json.dumps(det_list),
+            "schema": json.dumps(schema),
+        }
+        return self.user_prompt_template.format_map(data)
+
+    def _load_prompt_config(self) -> Dict[str, str]:
+        path = os.environ.get("VLM_PROMPTS_PATH", "").strip()
+        default_cfg = self._default_prompt_config()
+        if not path:
+            rel = os.path.join(os.path.dirname(__file__), "..", "..", "config", "vlm_prompts.json")
+            path = os.path.abspath(rel)
+        if os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    payload = json.load(f)
+                system = str(payload.get("system_prompt") or "").strip()
+                user = str(payload.get("user_prompt_template") or "").strip()
+                if system and user:
+                    logger.info("VLM prompt config loaded path=%s", path)
+                    return {"system_prompt": system, "user_prompt_template": user}
+                logger.warning("VLM prompt config missing fields path=%s; using defaults", path)
+            except Exception as exc:
+                logger.warning("VLM prompt config load failed path=%s err=%s; using defaults", path, exc)
+        else:
+            logger.info("VLM prompt config not found path=%s; using defaults", path)
+        return default_cfg
+
+    def _default_prompt_config(self) -> Dict[str, str]:
+        return {
+            "system_prompt": (
+                "You are a cautious OSINT satellite imagery analyst.\n"
+                "You must NOT infer function, ownership, or intent.\n"
+                "You must NOT use words like \"base\", \"military site\", \"warehouse\", or \"facility\" unless the function is visually undeniable.\n"
+                "If something is unclear, mark it as \"uncertain\" instead of guessing.\n"
+                "Your priority is descriptive accuracy, not classification.\n"
+                "Assume that human analysts will rely on your descriptions to search, filter, and verify objects later.\n"
+                "Return ONLY valid JSON. Do not change bbox. Do not invent new det_id. Use det_id mapping."
+            ),
+            "user_prompt_template": (
+                "You analyze a satellite tile. You are given YOLO detections as weak context.\n"
+                "Do NOT copy YOLO class names unless visually supported. Separate observation from interpretation.\n"
+                "Split your description into three levels:\n"
+                "1) Object-level: what is inside each bbox.\n"
+                "2) Local context: what is immediately around each object.\n"
+                "3) Tile-level environment: overall scene, terrain, activity traces.\n"
+                "If uncertain, explicitly use \"uncertain\" in the relevant fields.\n"
+                "{size_note}\n"
+                "YOLO tile class counts:\n{class_counts}\n"
+                "Detections (det_id mapping, do not change bbox):\n{detections}\n"
+                "Return ONLY JSON matching schema:\n{schema}\n"
+            ),
+        }
 
     def _load_json_strict(self, s: str) -> Dict[str, Any]:
         s = (s or "").strip()
